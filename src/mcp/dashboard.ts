@@ -27,7 +27,7 @@ import express from 'express';
 
 import type { Config } from '../config.ts';
 import { invalidate } from '../store.ts';
-import { isScheduledSyncPaused, runSyncProcess, syncWorkerCommand } from '../sync-process.ts';
+import { isScheduledSyncPaused, runSyncProcess, syncWorkerCommand, syncTimeoutMs } from '../sync-process.ts';
 import { searchHybrid, listThreads, listPeople, stats, type SearchContext } from '../search/search.ts';
 import * as wa from '../whatsapp/source.ts';
 import { recent, subscribe, emit } from './events.ts';
@@ -198,6 +198,8 @@ export function mountDashboard(app: express.Express, deps: DashboardDeps): void 
     if (!s.last_sync_at) {
       state = 'never';
       detail = 'The archive has never been synced.';
+    } else if (cfg.sourceType === 'windows-waren6') {
+      detail = `Windows snapshot last synced ${new Date(s.last_sync_at * 1000).toLocaleString()}; WhatsApp remains open during hot copy.`;
     } else if (!src.exists) {
       detail = 'WhatsApp Desktop store not found on this Mac.';
     } else if (src.mtime > s.last_sync_at) {
@@ -321,12 +323,14 @@ export function mountDashboard(app: express.Express, deps: DashboardDeps): void 
 
     try {
       const [command, args] = syncWorkerCommand(full);
-      const code = await runSyncProcess(command, args, {
+      const timeoutMs = syncTimeoutMs(cfg.sourceType);
+        const code = await runSyncProcess(command, args, {
+          timeoutMs,
         onOutput: (chunk) => emit(chunk.trimEnd()),
       });
       invalidate(); // a failed child may still have indexed some messages
       if (code !== 0) throw new Error(code === 124
-        ? 'sync exceeded 5 minutes; scheduled sync is paused until a manual sync succeeds'
+        ? `sync exceeded ${timeoutMs / 60000} minutes; scheduled sync is paused until a manual sync succeeds`
         : code === 75
           ? 'another sync is already running; this request was skipped'
         : `sync exited with code ${code}`);

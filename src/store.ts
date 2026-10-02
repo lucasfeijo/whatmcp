@@ -19,7 +19,8 @@ import { loadVectorIndex, type VectorIndex } from './search/vectors.ts';
 
 export interface Store {
   db: DB;
-  vectors: VectorIndex | null;
+  /** Loaded only when semantic search first requests them. */
+  readonly vectors: VectorIndex | null;
   /** Identity of the underlying file; changes when a sync writes to it. */
   key: string;
   model: string;
@@ -56,9 +57,17 @@ export function getStore(path: string, modelTag: string): Store {
   if (current && current.key === key && current.model === modelTag) return current;
 
   const db = openStoreRO(path);
+  let vectors: VectorIndex | null = null;
+  let vectorsLoaded = false;
   const next: Store = {
     db,
-    vectors: loadVectorIndex(db, modelTag),
+    get vectors() {
+      if (!vectorsLoaded) {
+        vectors = loadVectorIndex(db, modelTag);
+        vectorsLoaded = true;
+      }
+      return vectors;
+    },
     key,
     model: modelTag,
     loadedAt: Date.now(),

@@ -1,0 +1,19 @@
+<service>
+  <id>WhatMCP</id>
+  <name>WhatMCP HTTPS</name>
+  <description>WhatsApp archive MCP over authenticated HTTPS on port 8787.</description>
+  <executable>C:\Program Files\nodejs\node.exe</executable>
+  <arguments>--experimental-sqlite --experimental-strip-types --no-warnings "@PROJECT@\whatmcp\scripts\serve-https.mjs"</arguments>
+  <workingdirectory>@PROJECT@\whatmcp</workingdirectory>
+  <env name="WHATMCP_HOME" value="@PROJECT@\data"/>
+  <serviceaccount><domain>NT AUTHORITY</domain><user>LocalService</user></serviceaccount>
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <stoptimeout>30 sec</stoptimeout>
+  <logpath>@PROJECT@\data\logs</logpath>
+  <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>3</keepFiles></log>
+</service>

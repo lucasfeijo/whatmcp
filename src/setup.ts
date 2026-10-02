@@ -30,6 +30,7 @@ import { openStore } from './db/index.ts';
 import { embed as apiEmbed } from './index/openai.ts';
 import { calibrateThresholds } from './search/calibrate.ts';
 import { createSecretOutput } from './secret-input.ts';
+import { installWindowsSyncTask, disableWindowsSyncTask } from './windows-scheduler.ts';
 
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
@@ -310,6 +311,10 @@ async function calibrate(cfg: ReturnType<typeof loadConfig>): Promise<void> {
 
 /** Render and load the periodic-sync LaunchAgent. */
 export function installSyncAgent(hours: number): void {
+  if (process.platform === 'win32') {
+    installWindowsSyncTask(hours, REPO);
+    return;
+  }
   const agents = join(homedir(), 'Library/LaunchAgents');
   const logs = join(DATA_DIR, 'logs');
   if (!existsSync(agents)) mkdirSync(agents, { recursive: true });
@@ -332,6 +337,18 @@ export function installSyncAgent(hours: number): void {
   // job, so give the previous one a moment to actually go away.
   execFileSync('sleep', ['1']);
   execFileSync('launchctl', ['bootstrap', `gui/${uid}`, dest]);
+}
+
+/** Remove only the WhatMCP periodic task/agent, not its archive or logs. */
+export function disableSyncAgent(): void {
+  if (process.platform === 'win32') {
+    disableWindowsSyncTask();
+    return;
+  }
+  const uid = String(process.getuid?.() ?? 501);
+  try {
+    execFileSync('launchctl', ['bootout', `gui/${uid}/com.whatmcp.sync`], { stdio: 'ignore' });
+  } catch { /* not loaded */ }
 }
 
 /** Current idle-sleep setting in minutes, or null if it cannot be read. */

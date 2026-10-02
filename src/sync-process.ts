@@ -5,6 +5,10 @@ import { dirname, join } from 'node:path';
 import { DATA_DIR } from './config.ts';
 
 export const SYNC_TIMEOUT_MS = 5 * 60 * 1000;
+export const WINDOWS_SYNC_TIMEOUT_MS = 30 * 60 * 1000;
+export function syncTimeoutMs(sourceType: string): number {
+  return sourceType === 'windows-waren6' ? WINDOWS_SYNC_TIMEOUT_MS : SYNC_TIMEOUT_MS;
+}
 const STOP_GRACE_MS = 5 * 1000;
 export const SYNC_PAUSE_PATH = join(DATA_DIR, 'sync-paused.json');
 
@@ -52,6 +56,7 @@ export async function runSyncProcess(
   }
   const result = await new Promise<number>((resolve, reject) => {
     const child = spawn(command, args, {
+      windowsHide: true,
       stdio: onOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     });
     if (onOutput) {
@@ -64,6 +69,21 @@ export async function runSyncProcess(
 
     const stop = (signal: 'SIGINT' | 'SIGTERM') => {
       if (child.exitCode !== null || child.signalCode !== null) return;
+      if (process.platform === 'win32' && child.pid) {
+        // Terminate our worker tree before its parent disappears; WhatsApp is
+        // never spawned by the worker and is outside this tree.
+        const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+          windowsHide: true, stdio: 'ignore',
+        });
+        killer.once('error', (error) => console.error(`could not stop sync process tree: ${error.message}`));
+        killer.once('close', (code) => {
+          if (code !== 0 && child.exitCode === null && child.signalCode === null) {
+            console.error(`taskkill failed with exit ${code}`);
+            child.kill('SIGKILL');
+          }
+        });
+        return;
+      }
       child.kill(signal);
       stopTimer ??= setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');

@@ -1,10 +1,33 @@
 node_modules/
+.env
+.env.*
+!.env.example
 
 # The archive and the API key live in ~/.whatmcp/, never in the repo — but guard
 # against a stray WHATMCP_STORE pointing here.
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+windows-cases/
 config.json
 
 .DS_Store
+
+# Machine-local deployment state and secrets
+*.pfx
+*.p12
+*.key
+*.pem
+*.cer
+*.log
+deploy/windows/*.exe
+deploy/windows/whatmcp-service.xml
+docs/*.local.md
+scripts/enable-firewall.ps1
+scripts/prepare-local-tls.py
+scripts/verify-https.mjs
+runtime-windows.json
+tls-runtime.json

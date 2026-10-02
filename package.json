@@ -14,7 +14,7 @@
     "embed": "npm run wa -- embed",
     "doctor": "npm run wa -- doctor",
     "serve": "node --experimental-sqlite --experimental-strip-types --no-warnings src/mcp/server.ts",
-    "test": "node --experimental-sqlite --experimental-strip-types --no-warnings --test 'test/*.test.ts'",
+    "test": "node --experimental-sqlite --experimental-strip-types --no-warnings --test",
     "serve:http": "node --experimental-sqlite --experimental-strip-types --no-warnings src/mcp/http.ts",
     "setup": "node --experimental-sqlite --experimental-strip-types --no-warnings src/cli.ts setup"
   },

@@ -99,7 +99,7 @@ test('archive databases are forced to owner-only permissions', () => {
   try {
     const db = openStore(path);
     db.close();
-    assert.equal(statSync(path).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal(statSync(path).mode & 0o777, 0o600);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -125,7 +125,9 @@ test('set-key reads stdin and refuses credentials in argv', () => {
     assert.equal(safe.status, 0, safe.stderr);
     const config = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
     assert.equal(config.openai_api_key, 'sk-test-only-not-a-real-secret');
-    assert.equal(statSync(join(dir, 'config.json')).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') {
+      assert.equal(statSync(join(dir, 'config.json')).mode & 0o777, 0o600);
+    }
 
     const rejected = spawnSync(process.execPath, [...args, 'sk-visible-in-argv'], {
       cwd: join(import.meta.dirname, '..'),

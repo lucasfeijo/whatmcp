@@ -7,11 +7,17 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { openStore } from '../src/db/index.ts';
 import { buildServer } from '../src/mcp/tools.ts';
-import { invalidate } from '../src/store.ts';
+import { invalidate, getStore } from '../src/store.ts';
 
 test('message feed pages every message across tied timestamps without a query or API key', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'whatmcp-feed-'));
-  t.after(() => { invalidate(); rmSync(dir, { recursive: true, force: true }); });
+  const handles = new Set<ReturnType<typeof getStore>>();
+  t.after(() => {
+    invalidate();
+    for (const h of handles) { try { h.db.close(); } catch { /* already closed */ } }
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
   const path = join(dir, 'archive.db');
   const db = openStore(path);
   const thread = db.prepare(`INSERT INTO threads
@@ -27,7 +33,6 @@ test('message feed pages every message across tied timestamps without a query or
   message.run('a:3', 'a', 101, null, 'image', 0);
   message.run('b:2', 'b', 102, 'last', 'text', 0);
   message.run('b:3', 'b', 103, 'outside', 'text', 0);
-  db.close();
 
   const server = buildServer({
     cfg: {
@@ -44,6 +49,7 @@ test('message feed pages every message across tied timestamps without a query or
   t.after(async () => { await client.close(); await server.close(); });
 
   const read = async (args: Record<string, unknown>) => {
+    handles.add(getStore(path, 'openai/text-embedding-3-small@1536'));
     const result = await client.callTool({ name: 'list_messages_since', arguments: args });
     return (result.content as { type: string; text: string }[])[0].text;
   };

@@ -1,5 +1,9 @@
 # WhatMCP
 
+Windows users with an iPhone-backup archive: see [Windows integration](docs/WINDOWS.md)
+for the WAren6 dependency, incremental import, security limitations, and
+opt-in scheduling.
+
 A local MCP server over a local, durable archive of your WhatsApp history.
 
 See the [changelog](CHANGELOG.md) for changes in this fork.
@@ -181,8 +185,9 @@ cost fractions of a cent; a quiet interval costs nothing, since nothing new gets
 embedded.
 
 Scheduled, manual, MCP, and dashboard syncs run in a supervised child process.
-The supervisor stops a sync after 5 minutes (SIGTERM, then SIGKILL after 5 more
-seconds) and logs the timeout. Only one sync can run at a time; overlapping
+The supervisor stops a ChatStorage sync after 5 minutes (SIGTERM, then SIGKILL
+after 5 more seconds). Windows hot-copy sync has a 30-minute limit and stops
+the worker process tree on timeout. See [Windows setup](docs/WINDOWS.md). Only one sync can run at a time; overlapping
 requests are skipped immediately. After a timeout, scheduled attempts are paused
 instead of repeatedly waiting on a macOS permission prompt. Run `npm run sync`
 when you can respond to that prompt; a successful manual sync resumes the

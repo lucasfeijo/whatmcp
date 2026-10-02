@@ -704,7 +704,7 @@ export function stats(ctx: SearchContext): Stats {
     model: tag,
     earliest: one('SELECT MIN(ts) v FROM messages'),
     latest: one('SELECT MAX(ts) v FROM messages'),
-    last_sync_at: one('SELECT last_run_at v FROM sync_state WHERE id = \'whatsapp\''),
+    last_sync_at: one("SELECT MAX(last_run_at) v FROM sync_state WHERE id IN ('whatsapp', 'windows-waren6')"),
     watermark: one('SELECT last_source_pk v FROM sync_state WHERE id = \'whatsapp\''),
   };
 }

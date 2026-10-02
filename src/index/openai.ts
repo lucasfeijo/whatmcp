@@ -42,7 +42,20 @@ export function estimateTokens(s: string): number {
 
 const MAX_INPUTS_PER_REQUEST = 256;
 const MAX_TOKENS_PER_REQUEST = 250_000; // under the documented 300k ceiling
-export const MAX_TOKENS_PER_INPUT = 8_000; // model limit is 8192
+const MAX_BYTES_PER_INPUT = 8_000; // model limit is 8192 tokens
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, 'utf8');
+    if (bytes + size > maxBytes) break;
+    bytes += size;
+    end += char.length;
+  }
+  return text.slice(0, end);
+}
 
 export interface Batch {
   texts: string[];
@@ -56,12 +69,13 @@ export function splitBatches(texts: string[]): Batch[] {
   let curTrunc = 0;
 
   for (const t of texts) {
-    // A single over-long window is truncated rather than failing the whole run.
-    // With the chunker's 4,000-char cap this should never fire; it exists so a
-    // future cap change degrades instead of erroring.
-    const over = estimateTokens(t) > MAX_TOKENS_PER_INPUT;
-    const text = over ? t.slice(0, MAX_TOKENS_PER_INPUT * 2) : t;
-    const tk = estimateTokens(text);
+    // Emoji-heavy text can exceed the model limit within 4,000 characters.
+    // Truncate on code-point boundaries to keep the API request valid.
+    const over = Buffer.byteLength(t, 'utf8') > MAX_BYTES_PER_INPUT;
+    const text = over ? truncateUtf8(t, MAX_BYTES_PER_INPUT) : t;
+    // BPE's byte fallback cannot exceed the UTF-8 byte count. This upper bound
+    // also covers emoji-heavy messages that defeat the character estimate.
+    const tk = Buffer.byteLength(text, 'utf8');
 
     if (cur.length >= MAX_INPUTS_PER_REQUEST || curTokens + tk > MAX_TOKENS_PER_REQUEST) {
       if (cur.length > 0) batches.push({ texts: cur, truncated: curTrunc });

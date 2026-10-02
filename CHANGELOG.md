@@ -21,4 +21,3 @@ Notable changes to this fork of WhatMCP are recorded here.
 - Run `npm install`, then `npm run index` once to create the message-feed indexes before starting the MCP server.
 - If a macOS LaunchAgent was already installed, reapply its current cadence with `npm run wa -- sync-every <hours>` to install the updated scheduled command.
 - The feed filters by message time. Importing older history or editing an existing message can require rescanning an earlier interval. A macOS permission prompt can still block a sync until the user grants access.
-
