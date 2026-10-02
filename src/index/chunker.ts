@@ -24,6 +24,7 @@ export interface ChunkInput {
   sender_name: string | null;
   ts: number;
   text: string;
+  part_no?: number;
 }
 
 export interface Window {
@@ -35,6 +36,7 @@ export interface Window {
   text: string;
   first_msg_id: string;
   last_msg_id: string;
+  parts: { message_id: string; part_no: number }[];
 }
 
 export interface ChunkOptions {
@@ -74,13 +76,30 @@ export function windowHash(w: { thread_id: string; speakers: string; text: strin
 
 /**
  * Group messages into conversation windows.
- * Input need not be sorted; it is sorted by (thread, ts) internally.
+ * Input need not be sorted; it is sorted by (thread, ts, message id, part).
  */
 export function chunk(messages: ChunkInput[], opts: ChunkOptions = {}): Window[] {
   const { gapSeconds, maxMessages, maxChars } = { ...DEFAULTS, ...opts };
 
-  const sorted = [...messages].sort(
-    (a, b) => a.thread_id.localeCompare(b.thread_id) || a.ts - b.ts,
+  // Split before windowing: one long transcript must never bypass maxChars.
+  const pieces = messages.flatMap((m) => {
+    const allowance = Math.max(128, maxChars - (m.sender_name?.length ?? 7) - 3);
+    if (m.text.length <= allowance) return [{ ...m, part_no: m.part_no ?? 0 }];
+    const out: ChunkInput[] = [];
+    let rest = m.text.trim();
+    let part = m.part_no ?? 0;
+    while (rest.length > allowance) {
+      let cut = rest.lastIndexOf(' ', allowance);
+      if (cut < allowance / 2) cut = allowance;
+      out.push({ ...m, text: rest.slice(0, cut).trim(), part_no: part++ });
+      rest = rest.slice(cut).trimStart();
+    }
+    if (rest) out.push({ ...m, text: rest, part_no: part });
+    return out;
+  });
+  const sorted = pieces.sort(
+    (a, b) => a.thread_id.localeCompare(b.thread_id) || a.ts - b.ts ||
+      a.message_id.localeCompare(b.message_id) || (a.part_no ?? 0) - (b.part_no ?? 0),
   );
 
   const windows: Window[] = [];
@@ -94,11 +113,12 @@ export function chunk(messages: ChunkInput[], opts: ChunkOptions = {}): Window[]
       thread_id: buf[0].thread_id,
       start_ts: buf[0].ts,
       end_ts: buf[buf.length - 1].ts,
-      msg_count: buf.length,
+      msg_count: new Set(buf.map((m) => m.message_id)).size,
       speakers: speakers.join(', '),
       text: render(buf),
       first_msg_id: buf[0].message_id,
       last_msg_id: buf[buf.length - 1].message_id,
+      parts: buf.map((m) => ({ message_id: m.message_id, part_no: m.part_no ?? 0 })),
     });
     buf = [];
     runningChars = 0;
@@ -111,7 +131,7 @@ export function chunk(messages: ChunkInput[], opts: ChunkOptions = {}): Window[]
         m.thread_id !== prev.thread_id ||
         m.ts - prev.ts > gapSeconds ||
         buf.length >= maxMessages ||
-        runningChars + m.text.length > maxChars;
+        runningChars + m.text.length + (m.sender_name?.length ?? 7) + 2 > maxChars;
       if (broke) flush();
     }
     buf.push(m);

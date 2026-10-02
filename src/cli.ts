@@ -26,6 +26,11 @@ import { dirname, join } from 'node:path';
 import { readSecret } from './secret-input.ts';
 import { runSyncProcess, syncWorkerCommand } from './sync-process.ts';
 import { tryAcquireSyncLock } from './sync-lock.ts';
+import { availableModels } from './transcription/models.ts';
+import { importMediaManifest, runTranscription, scanConfiguredSource } from './transcription/worker.ts';
+import { mediaStats } from './transcription/media.ts';
+import { prepareReadyCandidates, publishCandidates,
+  reconcileProjectionModel } from './transcription/projection.ts';
 
 const argv = process.argv.slice(2);
 const [cmd, ...rest] = argv;
@@ -255,6 +260,7 @@ switch (cmd) {
     const t0 = Date.now();
     const r = runIndex(cfg.store, {
       chatstorage: cfg.chatstorage,
+      mediaSourceId: cfg.mediaSourceId,
       full: flag('full'),
       onProgress: (m) => console.log(`  ${m}`),
     });
@@ -265,6 +271,66 @@ switch (cmd) {
         `  ${r.totalMessages} message(s) archived, watermark Z_PK=${r.watermark}\n` +
         `  ${((Date.now() - t0) / 1000).toFixed(1)}s -> ${cfg.store}`,
     );
+    break;
+  }
+
+  case 'transcribe-models': {
+    for (const m of await availableModels(loadConfig())) {
+      console.log(`${m.model}: ${m.available ? 'available' : 'unavailable'} (${m.reason})`);
+    }
+    break;
+  }
+
+  case 'media': {
+    if (positional[0] !== 'import') {
+      console.error('usage: npm run wa -- media import --root=/path --source=id [--manifest=file.json]');
+      process.exitCode = 1;
+      break;
+    }
+    const root = flagValue('root');
+    const sourceId = flagValue('source', 'import')!;
+    if (!root || !existsSync(root) || !statSync(root).isDirectory()) {
+      throw new Error('an existing --root directory is required');
+    }
+    const cfg = loadConfig();
+    const manifest = flagValue('manifest');
+    if (manifest) {
+      const db = openStore(cfg.store);
+      try {
+        const r = importMediaManifest(db, sourceId, root, manifest);
+        console.log(`media: ${r.imported} linked, ${r.rejected} rejected`);
+      } finally { db.close(); }
+    } else {
+      const changed = await scanConfiguredSource({ ...cfg, mediaSourceId: sourceId }, true);
+      console.log(`media: ${changed} reference(s) linked from ChatStorage`);
+    }
+    writeFileConfig({ media_source_id: sourceId,
+      media_roots: { ...cfg.mediaRoots, [sourceId]: root } });
+    break;
+  }
+
+  case 'transcribe': {
+    const cfg = loadConfig();
+    const limit = Number(flagValue('limit', '100'));
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('--limit must be positive');
+    const result = await runTranscription(cfg, {
+      limit, retryErrors: flag('retry-errors'), onProgress: (m) => console.log(`  ${m}`),
+    });
+    console.log(`transcription: ${result.processed} done, ${result.noSpeech} without speech, ` +
+      `${result.unavailable} unavailable, ${result.failed} failed; ` +
+      `${result.prepared} conversation(s) prepared, ${result.published} published`);
+    break;
+  }
+
+  case 'project': {
+    const cfg = loadConfig();
+    const db = openStore(cfg.store);
+    try {
+      reconcileProjectionModel(db, cfg.transcriptionModel ?? null);
+      const prepared = prepareReadyCandidates(db, cfg, 100);
+      const published = publishCandidates(db, cfg, 100);
+      console.log(`${prepared} conversation(s) prepared, ${published} published`);
+    } finally { db.close(); }
     break;
   }
 
@@ -300,14 +366,12 @@ switch (cmd) {
     }
     try {
       const cfg = loadConfig();
-      // Fail before touching WhatsApp if the key is missing: a sync that indexes
-      // but cannot embed leaves the archive in a half-updated state that looks fine
-      // until someone runs a semantic query.
-      const ec = embedConfig(cfg);
+      const ec = cfg.openaiKey ? embedConfig(cfg) : null;
       const t0 = Date.now();
       console.log(bold('indexing'));
       const r = runIndex(cfg.store, {
         chatstorage: cfg.chatstorage,
+        mediaSourceId: cfg.mediaSourceId,
         full: flag('full'),
         onProgress: (m) => console.log(`  ${m}`),
       });
@@ -315,13 +379,17 @@ switch (cmd) {
         `  ${r.newMessages} new, ${r.updatedMessages} updated, ` +
           `${r.windowsBuilt} window(s) built  (${r.totalMessages} archived)`,
       );
-      console.log(bold('embedding'));
-      await embedMissing(cfg.store, ec, { onProgress });
-      const db = openStore(cfg.store);
-      const cov = vectorCoverage(db, ec);
-      db.close();
-      console.log(`  coverage: ${cov.embedded}/${cov.windows} (${cov.pct}%)`);
-      await calibrateIfUnset(cfg, cov.embedded);
+      if (ec) {
+        console.log(bold('embedding'));
+        await embedMissing(cfg.store, ec, { onProgress });
+        const db = openStore(cfg.store);
+        const cov = vectorCoverage(db, ec);
+        db.close();
+        console.log(`  coverage: ${cov.embedded}/${cov.windows} (${cov.pct}%)`);
+        await calibrateIfUnset(cfg, cov.embedded);
+      } else {
+        console.log('embedding skipped: no OpenAI key; FTS remains available');
+      }
       console.log(`done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     } finally {
       release();
@@ -395,7 +463,9 @@ switch (cmd) {
     }
     const at = around ? Math.floor(new Date(around).getTime() / 1000) : undefined;
     for (const m of getConversation(ctx(), { thread_id: thread, around_ts: at, limit: 80 })) {
-      console.log(`[${fmtTs(m.ts)}] ${m.sender_name}: ${m.text ?? `<${m.kind}>`}`);
+      console.log(`[${fmtTs(m.ts)}] ${m.sender_name}: ${m.text ?? `<${m.kind}>`}` +
+        (m.transcription_text ? `\n  Audio (${m.transcription_model}): ${m.transcription_text}` : '') +
+        (m.index_pending ? ' [index pending]' : ''));
     }
     break;
   }
@@ -406,6 +476,10 @@ switch (cmd) {
     console.log(`  file:        ${CONFIG_PATH}${existsSync(CONFIG_PATH) ? '' : '  (absent)'}`);
     console.log(`  openai key:  ${maskKey(cfg.openaiKey)}`);
     console.log(`  model:       ${cfg.openaiModel} @ ${cfg.openaiDims} dims`);
+    console.log(`  transcription: ${cfg.transcriptionModel ?? 'off'} (${cfg.transcriptionLocale})`);
+    for (const m of await availableModels(cfg)) {
+      console.log(`    ${m.model}: ${m.available ? 'ready' : m.reason}`);
+    }
     console.log(
       `  thresholds:  min_sim ${cfg.minSim ?? 'default'}, strong_sim ${cfg.strongSim ?? 'default'}` +
         (cfg.strongSim === undefined ? dim('   (run: npm run wa -- calibrate)') : ''),
@@ -439,6 +513,7 @@ switch (cmd) {
       }
     }
 
+    if (process.platform === 'darwin') {
     console.log(bold('\nbackground agents'));
     for (const label of ['com.whatmcp.sync', 'com.whatmcp.server', 'com.whatmcp.tunnel']) {
       let state = 'not installed';
@@ -453,6 +528,7 @@ switch (cmd) {
     }
     const iv = loadConfig().syncIntervalHours;
     console.log(`  sync cadence:        ${iv ? iv + 'h' : 'manual only'}`);
+    }
 
     console.log(bold('\narchive'));
     if (!existsSync(cfg.store)) {
@@ -471,6 +547,11 @@ switch (cmd) {
       );
       console.log(`  range:     ${fmtTs(s.earliest)} .. ${fmtTs(s.latest)}`);
       console.log(`  last sync: ${fmtTs(s.last_sync_at)}`);
+      const audio = mediaStats(getStore(cfg.store,
+        modelTag({ model: cfg.openaiModel, dimensions: cfg.openaiDims })).db);
+      console.log(`  audio: ${audio.available}/${audio.referenced} available; ` +
+        `${audio.done} transcript(s), ${audio.pendingThreads} conversation(s) pending publication`);
+      if (audio.lastError) console.log(`  audio last error: ${audio.lastError}`);
     }
     break;
   }
@@ -535,6 +616,10 @@ switch (cmd) {
   sync [--full]             index new messages, then embed anything missing
   index [--full]            index only
   embed [--limit=N]         embed only
+  media import --root=DIR    link audio from a prepared source or manifest
+  transcribe-models          check the three transcription models
+  transcribe [--limit=N]     resume audio transcription (default 100; --retry-errors after a fix)
+  project                   publish ready transcript windows
   calibrate                 fit similarity thresholds to this corpus
   doctor                    config, source readability, archive coverage
 

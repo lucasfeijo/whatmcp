@@ -15,12 +15,12 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 import {
-  loadConfig, writeFileConfig, ensureDataDir, maskKey,
+  loadConfig, readFileConfig, writeFileConfig, ensureDataDir, maskKey,
   CONFIG_PATH, DATA_DIR,
 } from './config.ts';
 import { runPreflight } from './preflight.ts';
@@ -30,6 +30,8 @@ import { openStore } from './db/index.ts';
 import { embed as apiEmbed } from './index/openai.ts';
 import { calibrateThresholds } from './search/calibrate.ts';
 import { createSecretOutput } from './secret-input.ts';
+import { availableModels, installAppleModel } from './transcription/models.ts';
+import { inventoryAudio, runTranscription } from './transcription/worker.ts';
 
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
@@ -93,8 +95,14 @@ export async function runSetup(): Promise<void> {
     console.log(dim('Local, read-only archive of your WhatsApp history, searchable by AI.\n'));
 
     // --- 1. preflight ------------------------------------------------------
-    rule('1. Checking this Mac');
+    rule('1. Checking the source');
     let cfg = loadConfig();
+    if (process.platform === 'win32') {
+      const source = await ask(`  Compatible ChatStorage.sqlite path [${cfg.chatstorage}]: `,
+        cfg.chatstorage);
+      writeFileConfig({ chatstorage: source, media_source_id: 'import' });
+      cfg = loadConfig();
+    }
     const checks = runPreflight(cfg.chatstorage);
     let blocked = false;
     for (const c of checks) {
@@ -112,9 +120,9 @@ export async function runSetup(): Promise<void> {
     // --- 2. API key --------------------------------------------------------
     rule('2. OpenAI API key');
     console.log(
-      'Used ONLY to turn text into embedding vectors, so search can match by\n' +
-      'meaning. Your messages, the archive and the search itself stay on this Mac.\n' +
-      dim('Indexing sends each conversation window once; searching sends the query.\n'),
+      'Used to embed conversation text; if you explicitly choose gpt-transcribe,\n' +
+      'audio files are also sent to OpenAI. The archive stays on this computer.\n' +
+      dim('Embedding sends each window once; semantic search sends its query.\n'),
     );
     if (cfg.openaiKey) {
       console.log(`  already configured: ${maskKey(cfg.openaiKey)}`);
@@ -122,19 +130,66 @@ export async function runSetup(): Promise<void> {
     } else {
       cfg = await promptKey(askSecret);
     }
-    if (!cfg.openaiKey) {
-      console.log(yellow('\nNo key set. You can still index and use keyword search:'));
-      console.log('  npm run wa -- index');
-      console.log('  npm run wa -- search "something" --mode=bm25');
-      return;
+    if (!cfg.openaiKey) console.log(yellow('  Keyword search and local Apple transcription remain available.'));
+
+    rule('3. Audio transcription');
+    const savedModel = readFileConfig().transcription_model;
+    let enable = false;
+    if (savedModel) {
+      console.log(`  currently enabled: ${savedModel}`);
+      enable = !(await confirm('  Turn transcription off?', false));
+      if (!enable) writeFileConfig({ transcription_model: null });
+    } else {
+      enable = await confirm('  Transcrever mensagens de áudio?', false);
+      if (!enable) writeFileConfig({ transcription_model: null });
+    }
+    if (enable && !savedModel) {
+      const available = (await availableModels(cfg)).filter((m) =>
+        m.available || m.reason === 'locale asset not installed');
+      if (!available.length) {
+        console.log(yellow('  No transcription model is available on this computer.'));
+        enable = false;
+        writeFileConfig({ transcription_model: null });
+      } else {
+        available.forEach((m, i) => console.log(`  ${i + 1}. ${m.model}` +
+          (m.available ? '' : ' (language asset download required)')));
+        const answer = Number(await ask('  Choose a model [1]: ', '1'));
+        if (!Number.isInteger(answer) || answer < 1 || answer > available.length) {
+          throw new Error('Invalid transcription model selection');
+        }
+        const model = available[answer - 1].model;
+        if (!available[answer - 1].available) {
+          if (!(await confirm('  Install the Apple language asset now?', false))) {
+            throw new Error('Language asset is required before selecting this model');
+          }
+          await installAppleModel(model, cfg.transcriptionLocale ?? 'pt-BR');
+        }
+        if (model === 'gpt-transcribe') {
+          console.log('  Audio will be uploaded to OpenAI. The resulting text will also be sent');
+          console.log('  to OpenAI if you later create text embeddings.');
+        }
+        writeFileConfig({ transcription_model: model });
+      }
+    }
+    cfg = loadConfig();
+    if (enable && process.platform === 'win32') {
+      const root = await ask('  Extracted audio directory (leave blank to add later): ');
+      if (root) {
+        if (!existsSync(root) || !statSync(root).isDirectory()) {
+          throw new Error('Extracted audio directory must exist');
+        }
+        writeFileConfig({ media_roots: { ...cfg.mediaRoots, import: root } });
+      }
+      cfg = loadConfig();
     }
 
-    // --- 3. build the archive ---------------------------------------------
-    rule('3. Building the archive');
+    // --- 4. build the archive ---------------------------------------------
+    rule('4. Building the archive');
     console.log('Reading WhatsApp\'s local database (a snapshot — the original is never written to).');
     const t0 = Date.now();
     const r = runIndex(cfg.store, {
       chatstorage: cfg.chatstorage,
+      mediaSourceId: cfg.mediaSourceId,
       onProgress: (m) => console.log(dim(`  ${m}`)),
     });
     console.log(
@@ -143,11 +198,14 @@ export async function runSetup(): Promise<void> {
       `(${((Date.now() - t0) / 1000).toFixed(1)}s)`,
     );
 
-    // --- 4. embeddings -----------------------------------------------------
-    rule('4. Embeddings');
-    const ec = { model: cfg.openaiModel, dimensions: cfg.openaiDims, apiKey: cfg.openaiKey };
-    const estimate = estimatePending(cfg.store, ec);
-    if (estimate.pending > 0) {
+    // --- 5. embeddings -----------------------------------------------------
+    rule('5. Embeddings');
+    const ec = { model: cfg.openaiModel, dimensions: cfg.openaiDims,
+      apiKey: cfg.openaiKey ?? '' };
+    const estimate = cfg.openaiKey ? estimatePending(cfg.store, ec) : null;
+    if (!cfg.openaiKey) {
+      console.log(dim('  Skipped: no API key. Keyword search is ready.'));
+    } else if (estimate && estimate.pending > 0) {
       console.log(
         `  ${estimate.pending.toLocaleString()} windows to embed ` +
         `(~${estimate.tokens.toLocaleString()} tokens), about ` +
@@ -175,8 +233,48 @@ export async function runSetup(): Promise<void> {
       console.log(`  ${green('✓')} already complete`);
     }
 
-    // --- 5. periodic sync --------------------------------------------------
-    rule('5. Keeping it up to date');
+    // --- 6. audio backfill -------------------------------------------------
+    if (enable && cfg.transcriptionModel) {
+      rule('6. Audio backfill');
+      const inventory = await inventoryAudio(cfg);
+      console.log(`  ${inventory.available} accessible audio file(s), ` +
+        `${inventory.unavailable} unavailable; ` +
+        `${(inventory.durationS / 3600).toFixed(1)} hours measured`);
+      if (inventory.durationUnknown) {
+        console.log(yellow(`  ${inventory.durationUnknown} duration(s) could not be measured; ` +
+          'cost and time below are incomplete.'));
+      }
+      console.log(`  estimated transcription time: ~${Math.ceil(inventory.estimatedSeconds / 60)} min ` +
+        '(pilot estimate; allow more for retries)');
+      if (cfg.transcriptionModel === 'gpt-transcribe') {
+        console.log(`  estimated audio API cost: ~$${inventory.estimatedCostUSD.toFixed(2)}`);
+      }
+      console.log('  Embedding cost is estimated from the actual new windows after transcription.');
+      if (inventory.available && await confirm('  Iniciar transcrição agora?', false)) {
+        const result = await runTranscription(cfg, {
+          limit: Infinity,
+          onProgress: (m) => console.log(dim(`  ${m}`)),
+        });
+        console.log(`  ${result.processed} transcribed, ${result.published} conversation(s) published`);
+        if (cfg.openaiKey) {
+          const followup = estimatePending(cfg.store, ec);
+          console.log(`  ${followup.pending} new window hash(es) to embed, ` +
+            `estimated $${followup.costUSD.toFixed(2)}`);
+          if (followup.pending && await confirm('  Embed transcript windows now?', false)) {
+            await embedMissing(cfg.store, ec);
+          }
+        }
+      } else {
+        console.log(dim('  Pending. Run `npm run wa -- transcribe` when ready.'));
+      }
+    }
+
+    // --- 7. periodic sync --------------------------------------------------
+    rule('7. Keeping it up to date');
+    if (process.platform !== 'darwin') {
+      console.log('  On Windows, import a refreshed compatible SQLite file and run `npm run sync`.');
+      console.log('  The native WhatsApp Windows database is not read automatically.');
+    } else {
     console.log(
       'WhatsApp prunes its own local database, so anything it drops before the\n' +
       'next sync is gone for good. A background sync every few hours is what makes\n' +
@@ -195,9 +293,11 @@ export async function runSetup(): Promise<void> {
       writeFileConfig({ sync_interval_hours: 0 });
       console.log(dim('  Manual only — run `npm run sync` when you want it.'));
     }
+    }
 
-    // --- 6. sleep ----------------------------------------------------------
-    rule('6. Sleep');
+    // --- 8. sleep ----------------------------------------------------------
+    if (process.platform === 'darwin') {
+    rule('8. Sleep');
     const sleepMin = currentSleepMinutes();
     console.log(
       'A sleeping Mac does not sync, and does not serve remote requests.\n' +
@@ -213,9 +313,10 @@ export async function runSetup(): Promise<void> {
       dim('    sudo pmset -c sleep 0        (needs your password; -c = plugged in only)\n') +
       dim('    sudo pmset -c sleep 10       to undo it later\n'),
     );
+    }
 
-    // --- 7. connect --------------------------------------------------------
-    rule('7. Connect an AI client');
+    // --- 9. connect --------------------------------------------------------
+    rule('9. Connect an AI client');
     const serverPath = join(REPO, 'src/mcp/server.ts');
     console.log('Claude Code:\n');
     console.log(dim(
@@ -223,7 +324,9 @@ export async function runSetup(): Promise<void> {
       `--experimental-strip-types --no-warnings ${serverPath}\n`,
     ));
     console.log('Claude Desktop — add to');
-    console.log(dim('  ~/Library/Application Support/Claude/claude_desktop_config.json\n'));
+    console.log(dim(process.platform === 'win32'
+      ? '  %APPDATA%\\Claude\\claude_desktop_config.json\n'
+      : '  ~/Library/Application Support/Claude/claude_desktop_config.json\n'));
     console.log(dim(JSON.stringify({
       mcpServers: {
         whatmcp: {
@@ -241,7 +344,7 @@ export async function runSetup(): Promise<void> {
       `\n${dim('No API key goes in that file — a GUI-launched server inherits none of your')}\n` +
       `${dim('shell environment, which is why the key lives in ~/.whatmcp/config.json.')}`,
     );
-    console.log(
+    if (process.platform === 'darwin') console.log(
       `\n${yellow('If you use Claude Desktop')}, grant it Full Disk Access too ` +
       `(System Settings ->\nPrivacy & Security), or syncing from inside it will fail ` +
       `the same way\nthis script would have.`,

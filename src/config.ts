@@ -18,6 +18,10 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from 'n
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+export type TranscriptionModel = 'apple-speech' | 'apple-dictation' | 'gpt-transcribe';
+export const TRANSCRIPTION_MODELS: TranscriptionModel[] =
+  ['apple-speech', 'apple-dictation', 'gpt-transcribe'];
+
 export const DATA_DIR = process.env.WHATMCP_HOME ?? join(homedir(), '.whatmcp');
 export const CONFIG_PATH = join(DATA_DIR, 'config.json');
 
@@ -40,6 +44,12 @@ export interface FileConfig {
   /** Written by `wa calibrate`; see search.ts for why these are not constants. */
   min_sim?: number;
   strong_sim?: number;
+  transcription_model?: TranscriptionModel | null;
+  transcription_locale?: string;
+  media_source_id?: string;
+  media_roots?: Record<string, string>;
+  ffmpeg_path?: string;
+  ffprobe_path?: string;
 
   // --- HTTP transport (optional; stdio needs none of this) ---
   /** Bearer token. Full read access to the entire archive — treat as a password. */
@@ -102,6 +112,12 @@ export interface Config {
   strongSim?: number;
   /** Background sync cadence in hours; 0 means manual only. */
   syncIntervalHours: number;
+  transcriptionModel?: TranscriptionModel | null;
+  transcriptionLocale?: string;
+  mediaSourceId?: string;
+  mediaRoots?: Record<string, string>;
+  ffmpegPath?: string;
+  ffprobePath?: string;
 }
 
 export const NATIVE_DIMS: Record<string, number> = {
@@ -111,6 +127,9 @@ export const NATIVE_DIMS: Record<string, number> = {
 
 export function loadConfig(): Config {
   const f = readFileConfig();
+  if (f.transcription_model != null && !TRANSCRIPTION_MODELS.includes(f.transcription_model)) {
+    throw new Error(`Unknown transcription_model: ${f.transcription_model}`);
+  }
   const model = process.env.WHATMCP_OPENAI_MODEL ?? f.openai_model ?? 'text-embedding-3-small';
   const dims = Number(
     process.env.WHATMCP_OPENAI_DIMS ?? f.openai_dims ?? NATIVE_DIMS[model] ?? 1536,
@@ -124,6 +143,19 @@ export function loadConfig(): Config {
     minSim: f.min_sim,
     strongSim: f.strong_sim,
     syncIntervalHours: Number(f.sync_interval_hours ?? 0),
+    transcriptionModel: f.transcription_model ?? null,
+    transcriptionLocale: f.transcription_locale ?? 'pt-BR',
+    mediaSourceId: f.media_source_id ??
+      (process.platform === 'darwin' && (f.chatstorage ?? DEFAULT_CHATSTORAGE) === DEFAULT_CHATSTORAGE
+        ? 'macos' : 'import'),
+    mediaRoots: {
+      ...(process.platform === 'darwin'
+        ? { macos: join(homedir(), 'Library/Group Containers/group.net.whatsapp.WhatsApp.shared/Message') }
+        : {}),
+      ...f.media_roots,
+    },
+    ffmpegPath: f.ffmpeg_path ?? 'ffmpeg',
+    ffprobePath: f.ffprobe_path ?? 'ffprobe',
   };
 }
 

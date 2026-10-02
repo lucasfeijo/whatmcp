@@ -21,6 +21,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
+import { DEFAULT_CHATSTORAGE } from './config.ts';
 
 export interface Check {
   ok: boolean;
@@ -104,9 +105,10 @@ export function checkStoreReadable(chatstorage: string): Check {
       label: 'WhatsApp store',
       detail: `not found at ${chatstorage}`,
       fix:
-        'Sign in to WhatsApp Desktop at least once so it creates its local\n' +
-        'database, then retry. If you use a non-standard location, set\n' +
-        '"chatstorage" in ~/.whatmcp/config.json.',
+        process.platform === 'darwin' && chatstorage === DEFAULT_CHATSTORAGE
+          ? 'Sign in to WhatsApp Desktop at least once so it creates its local\n' +
+            'database, then retry. If you use another source, set "chatstorage" in config.json.'
+          : 'Provide the absolute path of a readable, compatible ChatStorage.sqlite.',
     };
   }
 
@@ -123,6 +125,11 @@ export function checkStoreReadable(chatstorage: string): Check {
     }
     return { ok: true, label: 'WhatsApp store', detail: 'readable' };
   } catch (e) {
+    if (process.platform !== 'darwin' || chatstorage !== DEFAULT_CHATSTORAGE) {
+      return { ok: false, label: 'Source SQLite',
+        detail: `cannot read it (${(e as Error).message.split('\n')[0]})`,
+        fix: 'Check file permissions and provide a readable, compatible ChatStorage.sqlite.' };
+    }
     const host = likelyHostApp();
     return {
       ok: false,
@@ -142,5 +149,7 @@ export function checkStoreReadable(chatstorage: string): Check {
 }
 
 export function runPreflight(chatstorage: string): Check[] {
-  return [checkNode(), checkWhatsAppInstalled(), checkStoreReadable(chatstorage)];
+  return process.platform === 'darwin' && chatstorage === DEFAULT_CHATSTORAGE
+    ? [checkNode(), checkWhatsAppInstalled(), checkStoreReadable(chatstorage)]
+    : [checkNode(), checkStoreReadable(chatstorage)];
 }

@@ -78,6 +78,16 @@ export function backfillHashes(db: DB): number {
   return rows.length;
 }
 
+function settleVectorStatuses(db: DB, tag: string): void {
+  db.prepare(`UPDATE thread_projection_state SET status = 'current'
+    WHERE status = 'vectors_pending' AND desired_generation = active_generation
+      AND NOT EXISTS (
+        SELECT 1 FROM windows w LEFT JOIN window_vectors v
+          ON v.content_hash = w.content_hash AND v.model = ?
+        WHERE w.thread_id = thread_projection_state.thread_id AND v.content_hash IS NULL
+      )`).run(tag);
+}
+
 /**
  * What a sync would cost, without embedding anything.
  *
@@ -94,9 +104,12 @@ export function estimatePending(
   try {
     backfillHashes(db);
     const rows = db.prepare(`
+      WITH payload AS (
+        SELECT content_hash, text FROM windows
+        UNION ALL SELECT content_hash, text FROM candidate_windows
+      )
       SELECT DISTINCT w.content_hash AS hash, w.text AS text
-      FROM windows w
-      LEFT JOIN window_vectors v
+      FROM payload w LEFT JOIN window_vectors v
         ON v.content_hash = w.content_hash AND v.model = ?
       WHERE v.content_hash IS NULL AND w.content_hash IS NOT NULL
     `).all(modelTag(cfg)) as { hash: string; text: string }[];
@@ -131,9 +144,12 @@ export async function embedMissing(
      */
     let pending = db
       .prepare(`
+        WITH payload AS (
+          SELECT content_hash, text FROM windows
+          UNION ALL SELECT content_hash, text FROM candidate_windows
+        )
         SELECT DISTINCT w.content_hash AS hash, w.text AS text
-        FROM windows w
-        LEFT JOIN window_vectors v
+        FROM payload w LEFT JOIN window_vectors v
           ON v.content_hash = w.content_hash AND v.model = ?
         WHERE v.content_hash IS NULL AND w.content_hash IS NOT NULL
         ORDER BY w.content_hash
@@ -156,6 +172,7 @@ export async function embedMissing(
     });
 
     if (pending.length === 0) {
+      settleVectorStatuses(db, tag);
       const res = {
         embedded: 0, failed: 0, skipped: total, pending: 0, truncated: 0,
         tokens: 0, costUSD: 0, elapsedMs: Date.now() - t0,
@@ -254,6 +271,7 @@ export async function embedMissing(
     }
 
     const costUSD = estimateCostUSD(cfg.model, tokens);
+    settleVectorStatuses(db, tag);
     const res = {
       embedded,
       failed,

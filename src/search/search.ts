@@ -390,6 +390,40 @@ export interface Msg {
   text: string | null;
   kind: string;
   is_from_me: number;
+  transcription_text?: string | null;
+  transcription_model?: string | null;
+  transcription_status?: string | null;
+  index_pending?: boolean;
+}
+
+function withTranscripts<T extends Msg>(db: DB, rows: T[]): T[] {
+  const transcript = db.prepare(`
+    SELECT t.text, t.model, t.status,
+      CASE WHEN active.message_id IS NOT NULL THEN 1 ELSE 0 END is_active
+    FROM audio_transcripts t
+    LEFT JOIN audio_media media ON media.message_id = t.message_id
+    LEFT JOIN active_transcripts active ON active.message_id = t.message_id
+      AND active.audio_sha256 = t.audio_sha256 AND active.model = t.model
+      AND active.model_revision = t.model_revision AND active.locale = t.locale
+    WHERE t.message_id = ? AND t.status IN ('done', 'no_speech')
+      AND (t.audio_sha256 = media.sha256 OR active.message_id IS NOT NULL)
+    ORDER BY CASE WHEN t.audio_sha256 = media.sha256 THEN 0 ELSE 1 END,
+      t.updated_at DESC LIMIT 1
+  `);
+  const state = db.prepare(`SELECT desired_generation, active_generation
+    FROM thread_projection_state WHERE thread_id = ?`);
+  return rows.map((row) => {
+    const t = transcript.get(row.id) as {
+      text: string | null; model: string; status: string; is_active: number } | undefined;
+    if (!t) return row;
+    const projection = state.get((row as T & { thread_id?: string }).thread_id ??
+      row.id.slice(0, row.id.lastIndexOf(':'))) as
+      { desired_generation: number; active_generation: number } | undefined;
+    return { ...row, transcription_text: t.text, transcription_model: t.model,
+      transcription_status: t.status,
+      index_pending: !t.is_active || !!projection &&
+        projection.desired_generation > projection.active_generation };
+  });
 }
 
 /**
@@ -412,7 +446,7 @@ export function getConversation(ctx: SearchContext, p: ConversationParams): Msg[
     const rows = db
       .prepare(`${sel} ORDER BY m.ts DESC, m.id DESC LIMIT ?`)
       .all(p.thread_id, limit) as any[];
-    return rows.reverse() as Msg[];
+    return withTranscripts(db, rows.reverse() as Msg[]);
   }
 
   /*
@@ -439,7 +473,7 @@ export function getConversation(ctx: SearchContext, p: ConversationParams): Msg[
               ORDER BY m.ts ASC, m.id ASC LIMIT ?`)
     .all(p.thread_id, p.around_ts, p.around_ts, pivot.id ?? '', limit - half) as any[];
 
-  return [...before.reverse(), ...after] as Msg[];
+  return withTranscripts(db, [...before.reverse(), ...after] as Msg[]);
 }
 
 // --- chronological message feed ---------------------------------------------
@@ -487,7 +521,8 @@ export function listMessageFeed(
     ...(p.last ? [p.last.ts, p.last.id] : []),
     p.limit + 1,
   ) as FeedMessage[];
-  return { messages: rows.slice(0, p.limit), hasMore: rows.length > p.limit };
+  return { messages: withTranscripts(db, rows.slice(0, p.limit)),
+    hasMore: rows.length > p.limit };
 }
 
 // --- chats, people, timeline -------------------------------------------------

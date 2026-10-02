@@ -38,6 +38,13 @@ export interface RawMessage {
   msg_type: number;
 }
 
+export interface RawAudioReference {
+  message_id: string;
+  thread_id: string;
+  source_pk: number;
+  relative_path: string;
+}
+
 /**
  * Copy the live store somewhere safe to read. Returns the snapshot path; the
  * caller owns the temp directory's lifetime.
@@ -233,6 +240,39 @@ export function extract(snapshotPath: string, sincePk = 0): RawMessage[] {
       });
     }
     return out;
+  } finally {
+    db.close();
+  }
+}
+
+/** Extract only media references. Older compatible sources may lack these columns. */
+export function extractAudioReferences(snapshotPath: string, sincePk = 0): RawAudioReference[] {
+  const db = openSourceRO(snapshotPath);
+  try {
+    const columns = (db.prepare('PRAGMA table_info(ZWAMESSAGE)').all() as { name: string }[])
+      .map((row) => row.name);
+    const hasMediaTable = db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ZWAMEDIAITEM'",
+    ).get();
+    if (!columns.includes('ZMEDIAITEM') || !hasMediaTable) return [];
+    const rows = db.prepare(`
+      SELECT m.Z_PK pk, m.ZSTANZAID stanza_id, c.ZCONTACTJID thread_jid,
+             media.ZMEDIALOCALPATH relative_path
+      FROM ZWAMESSAGE m
+      JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION
+      JOIN ZWAMEDIAITEM media ON media.Z_PK = m.ZMEDIAITEM
+      WHERE m.ZMESSAGETYPE = 3 AND m.Z_PK > ?
+        AND media.ZMEDIALOCALPATH IS NOT NULL
+        AND media.ZMEDIALOCALPATH <> ''
+      ORDER BY m.Z_PK
+    `).all(sincePk) as { pk: number; stanza_id: string | null;
+      thread_jid: string; relative_path: string }[];
+    return rows.filter((r) => isRealChat(r.thread_jid)).map((r) => ({
+      message_id: `${r.thread_jid}:${r.stanza_id || `pk-${r.pk}`}`,
+      thread_id: r.thread_jid,
+      source_pk: Number(r.pk),
+      relative_path: String(r.relative_path),
+    }));
   } finally {
     db.close();
   }

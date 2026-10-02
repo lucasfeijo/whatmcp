@@ -71,7 +71,8 @@ npm run wa -- search "a topic from your messages"
 
 `set-key` prompts for the API key without showing it and saves it in the config
 file. Skip this step if a key is already configured. Embedding sends conversation
-text to OpenAI and incurs API charges. Semantic search sends the search query.
+text, including published transcripts, to OpenAI and incurs API charges. Semantic
+search sends the search query.
 
 Keyword search does not need an API key or embeddings:
 
@@ -80,11 +81,14 @@ npm run wa -- search "a word from your messages" --mode=bm25
 npm run wa -- chats
 ```
 
-The guided `setup` and parts of `doctor` check macOS paths and services. Do not
-use their macOS installation checks to assess a Windows file import. Check the
-index output, list chats, and search the archive. The MCP `get_archive_status`
+The guided `setup` accepts an explicit compatible SQLite path on Windows and
+skips macOS services. Check the index output, list chats, and search the archive.
+The MCP `get_archive_status`
 tool reports counts and embedding coverage; source freshness is based on the
 configured file, not on the phone.
+
+To link extracted audio files, see [Audio transcription](AUDIO.md). A SQLite
+file without the matching media bytes cannot be transcribed.
 
 ## Data and configuration paths
 

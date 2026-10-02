@@ -17,7 +17,9 @@ import { rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { openStore, type DB } from '../db/index.ts';
 import * as wa from '../whatsapp/source.ts';
-import { chunk, windowHash, type ChunkInput } from './chunker.ts';
+import { chunk, windowHash, type Window } from './chunker.ts';
+import { markProjectionDirty, scanSourceMedia } from '../transcription/media.ts';
+import { projectionInputs } from '../transcription/projection.ts';
 
 const SYNC_ID = 'whatsapp';
 
@@ -39,6 +41,7 @@ export interface IndexOptions {
   full?: boolean;
   /** Use a snapshot someone else made; its lifetime stays theirs. */
   snapshotPath?: string;
+  mediaSourceId?: string;
   onProgress?: (msg: string) => void;
 }
 
@@ -120,6 +123,7 @@ export function runIndex(storePath: string, opts: IndexOptions): IndexResult {
     const existing = db.prepare('SELECT 1 FROM messages WHERE id = ?');
 
     const touched = new Set<string>();
+    const audioTouched = new Set<string>();
     let newMessages = 0;
     let updatedMessages = 0;
 
@@ -152,6 +156,15 @@ export function runIndex(storePath: string, opts: IndexOptions): IndexResult {
         // a thread for rebuild. An unchanged existing message must not: on a full
         // pass that would mark every thread and rebuild 5k windows to gain nothing.
         if (wa.isTexty(m) && (isNew || Number(res.changes) > 0)) touched.add(m.thread_id);
+        if (wa.messageKind(m.msg_type) === 'audio' && (isNew || Number(res.changes) > 0)) {
+          audioTouched.add(m.thread_id);
+        }
+      }
+      scanSourceMedia(db, snap, opts.mediaSourceId ?? 'macos', source.maxPk, fullPass);
+      for (const threadId of audioTouched) markProjectionDirty(db, threadId);
+      const hasProjection = db.prepare('SELECT 1 FROM thread_projection_state WHERE thread_id = ?');
+      for (const threadId of touched) {
+        if (hasProjection.get(threadId)) markProjectionDirty(db, threadId);
       }
       db.exec('COMMIT');
     } catch (e) {
@@ -219,18 +232,33 @@ export function rebuildWindows(
 ): { built: number; dropped: number } {
   if (threadIds.length === 0) return { built: 0, dropped: 0 };
 
-  const selectMsgs = db.prepare(`
-    SELECT m.id AS message_id, m.thread_id, m.ts, m.text,
-           CASE WHEN m.is_from_me = 1 THEN 'me'
-                ELSE COALESCE(s.display_name, s.id, 'unknown') END AS sender_name
-    FROM messages m
-    LEFT JOIN senders s ON s.id = m.sender_id
-    WHERE m.thread_id = ? AND m.text IS NOT NULL AND m.text <> ''
-    ORDER BY m.ts, m.id
+  let built = 0;
+  let dropped = 0;
+
+  db.exec('BEGIN');
+  try {
+    for (const threadId of threadIds) {
+      const fresh = chunk(projectionInputs(db, threadId, 'active'));
+      const result = replaceThreadWindows(db, threadId, fresh);
+      built += result.built;
+      dropped += result.dropped;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+
+  return { built, dropped };
+}
+
+/** Caller owns the transaction, including publication of transcript selection. */
+export function replaceThreadWindows(db: DB, threadId: string, fresh: Window[]): {
+  built: number; dropped: number } {
+  const existing = db.prepare(`
+    SELECT id, content_hash, text, speakers, first_msg_id, last_msg_id
+    FROM windows WHERE thread_id = ?
   `);
-  const existing = db.prepare(
-    'SELECT id, content_hash, text, speakers FROM windows WHERE thread_id = ?',
-  );
   // A contentless FTS5 table needs the original column values to delete a row.
   const delFts = db.prepare(
     "INSERT INTO windows_fts(windows_fts, rowid, text, speakers) VALUES('delete', ?, ?, ?)",
@@ -243,56 +271,49 @@ export function rebuildWindows(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insFts = db.prepare('INSERT INTO windows_fts(rowid, text, speakers) VALUES (?, ?, ?)');
+  const delParts = db.prepare('DELETE FROM window_message_parts WHERE window_id = ?');
+  const insPart = db.prepare(`
+    INSERT OR IGNORE INTO window_message_parts(window_id, message_id, part_no)
+    VALUES (?, ?, ?)
+  `);
 
   let built = 0;
   let dropped = 0;
 
-  db.exec('BEGIN');
-  try {
-    for (const threadId of threadIds) {
-      const msgs = selectMsgs.all(threadId) as ChunkInput[];
-      const fresh = chunk(msgs).map((w) => ({ w, hash: windowHash(w) }));
-
-      // Count occurrences rather than using a Set: identical short exchanges
-      // ("me: on my way") genuinely recur within one thread, and a Set would keep
-      // dropping one of each duplicate pair on every single run.
-      const want = new Map<string, number>();
-      for (const { hash } of fresh) want.set(hash, (want.get(hash) ?? 0) + 1);
-
-      const stale: { id: number; text: string; speakers: string }[] = [];
-      const keep = new Map<string, number>();
-      for (const row of existing.all(threadId) as {
-        id: number; content_hash: string | null; text: string; speakers: string;
-      }[]) {
-        const h = row.content_hash;
-        const still = h ? (want.get(h) ?? 0) : 0;
-        const kept = h ? (keep.get(h) ?? 0) : 0;
-        if (h && kept < still) keep.set(h, kept + 1);
-        else stale.push(row);
-      }
-
-      for (const row of stale) {
-        delFts.run(row.id, row.text, row.speakers);
-        delWin.run(row.id);
-        dropped++;
-      }
-
-      const have = new Map(keep);
-      for (const { w, hash } of fresh) {
-        const n = have.get(hash) ?? 0;
-        if (n > 0) { have.set(hash, n - 1); continue; }
-        const res = insWin.run(
-          w.thread_id, w.start_ts, w.end_ts, w.msg_count,
-          w.speakers, w.text, w.first_msg_id, w.last_msg_id, hash,
-        );
-        insFts.run(Number(res.lastInsertRowid), w.text, w.speakers);
-        built++;
-      }
+  const identity = (w: { content_hash: string | null; first_msg_id: string;
+    last_msg_id: string }) => `${w.content_hash}\x1f${w.first_msg_id}\x1f${w.last_msg_id}`;
+  const old = new Map<string, { id: number; text: string; speakers: string }[]>();
+  for (const row of existing.all(threadId) as {
+    id: number; content_hash: string | null; text: string; speakers: string;
+    first_msg_id: string; last_msg_id: string }[]) {
+    const key = identity(row);
+    const list = old.get(key) ?? [];
+    list.push(row);
+    old.set(key, list);
+  }
+  for (const w of fresh) {
+    const hash = windowHash(w);
+    const key = identity({ content_hash: hash, first_msg_id: w.first_msg_id,
+      last_msg_id: w.last_msg_id });
+    const kept = old.get(key)?.shift();
+    const id = kept ? kept.id : Number(insWin.run(
+      w.thread_id, w.start_ts, w.end_ts, w.msg_count,
+      w.speakers, w.text, w.first_msg_id, w.last_msg_id, hash,
+    ).lastInsertRowid);
+    if (!kept) {
+      insFts.run(id, w.text, w.speakers);
+      built++;
     }
-    db.exec('COMMIT');
-  } catch (e) {
-    db.exec('ROLLBACK');
-    throw e;
+    delParts.run(id);
+    for (const part of w.parts) insPart.run(id, part.message_id, part.part_no);
+  }
+  for (const rows of old.values()) {
+    for (const row of rows) {
+      delFts.run(row.id, row.text, row.speakers);
+      delParts.run(row.id);
+      delWin.run(row.id);
+      dropped++;
+    }
   }
 
   return { built, dropped };

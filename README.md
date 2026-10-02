@@ -25,13 +25,13 @@ Indexing, embedding, search, and the MCP servers use Node.js and SQLite. The
 source reader expects the WhatsApp Core Data schema. A file import does not
 require WhatsApp to be installed on the computer that runs WhatMCP.
 
-The guided setup, default source path, macOS checks in `doctor`, scheduled sync,
-and deployment scripts target macOS. On Windows, use the manual commands and an
-explicit source path. There is no source adapter for the Windows WhatsApp app.
+The guided setup also accepts a compatible SQLite file on Windows. Scheduled sync
+and deployment scripts target macOS. There is no source adapter for the Windows
+WhatsApp app; Windows imports need an explicit source path.
 
 For macOS Desktop setup, `npm run setup` checks permissions, prompts for an API
 key, and builds the archive. It shows the estimated embedding cost before asking
-to proceed.
+to proceed. Audio transcription is optional; see [Audio transcription](docs/AUDIO.md).
 
 <img width="653" height="381" alt="file-e6e5a56497e3ab9e15559e8d93e58d4c" src="https://github.com/user-attachments/assets/6ee373f8-84c0-4f94-b8ec-d1d5e52d2ec3" />
 
@@ -39,10 +39,12 @@ to proceed.
 > as your terminal or MCP client. This is required to read the protected WhatsApp
 > Desktop database. `npm run setup` and `npm run doctor` check this access.
 
-Everything stays on this machine except one thing, stated up front: **text is sent
-to OpenAI to be embedded** — every conversation window once at index time, and
-each semantic search query thereafter. The archive, vectors, index, and search
-stay on the computer that runs WhatMCP.
+The archive, vectors, index, and search stay on this computer. **Conversation
+text is sent to OpenAI for embeddings** when embedding is enabled, as is each
+semantic search query. Audio transcription is off by default. Choosing
+`gpt-transcribe` explicitly sends accessible audio files to OpenAI; the two
+Apple models run locally on a supported Mac. Transcript text included in a
+conversation window is also sent when that window is embedded.
 
 ```
 WhatsApp Desktop (macOS) or a compatible database file
@@ -461,8 +463,8 @@ src/
 
 ## Known limits
 
-- **Media is not indexed** — only messages carrying text. Media rows are archived
-  (so nothing is lost) but contribute nothing to search.
+- **Only accessible audio can be transcribed.** The source database can contain a
+  media path without the file. Images, videos, and other media are not embedded.
 - **No reply threading.** WhatsApp's parent-message reference did not populate on
   any build tested, so the field was removed rather than shipped permanently NULL.
 - **Name resolution is 96% complete, not 100%.** On this store `ZWAGROUPMEMBER.
