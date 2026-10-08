@@ -18,10 +18,20 @@ React + Tauri 2 app for macOS ARM64 and Windows x64. Portuguese consumer UI:
 
 ## Data and process boundaries
 
-Every launch starts in a persistent **synthetic demo**, under the app's data folder
-(`com.whatmcp.desktop/profiles/demo`, platform-specific Application Support/AppData).
-It does not discover or open `~/.whatmcp`. Settings can open the separate app-owned
-archive or an explicitly chosen existing profile containing config.json/archive.db.
+First launch offers **Configure my WhatsApp** or **Explore the demo**. The demo has
+an always-visible notice linking back to setup. The four-step wizard selects an
+app-owned or explicitly chosen existing profile, explains platform connection and
+permissions, saves optional search/transcription settings, and offers manual first
+sync. Text browsing needs no cloud key. Completed setup remembers the chosen profile;
+unfinished setup resumes from the last completed step. A missing/incompatible saved
+profile falls back to the demo with recovery instructions, without migrating data.
+
+App-owned profiles live under `com.whatmcp.desktop/profiles/demo` and `profiles/archive`
+in platform-specific Application Support/AppData. The app does not discover or open
+`~/.whatmcp` until explicitly selected. The selector accepts `~/` and clears stale
+warnings on success. Profile switches discard replies from the previous runtime.
+Startup preferences are atomically saved in the app-owned `desktop-state.json` and
+contain no API key. Settings can reopen the guided flow at any time.
 Existing profiles must have the current schema: selection does not migrate them.
 Reading works without a provider key; requested jobs/config edits write the selected
 profile. Updates preserve that directory outside the application bundle.
@@ -70,8 +80,9 @@ End users do not need Node/Rust/Xcode. macOS 13+ supports archive browsing; Appl
 transcription requires 26+. Windows uses the existing external **WAren6** adapter;
 its configured installation and a supported local WhatsApp source are required for
 live sync. Local Whisper uses the backend's existing faster-whisper adapter: select an already
-installed Python environment and local CTranslate2 model in Settings. Nothing is
-installed or downloaded automatically. Audio conversion needs **FFmpeg/FFprobe** installed or absolute executable
+installed Python environment and local CTranslate2 model in Settings. The wizard can explicitly download Apple speech assets. Other external tools
+(FFmpeg/FFprobe, local Whisper/Python/model, WAren6) still require an existing installation;
+they are checked or configured through the wizard and Settings, not installed globally. Audio conversion needs **FFmpeg/FFprobe** installed or absolute executable
 paths selected in Settings. These tools are not installed automatically or bundled
 by this PR. GPT transcription/real semantic search need an OpenAI key, may incur
 provider costs and transmit the corresponding audio/text. The local key is stored
@@ -84,6 +95,8 @@ npm ci
 npm ci --prefix desktop
 npm run prepare:runtime --prefix desktop
 npm test -- --test-concurrency=2
+# Startup/profile persistence and recovery:
+cargo test --manifest-path desktop/src-tauri/Cargo.toml --offline
 cd desktop
 npm run tauri -- build --bundles app,dmg  # macOS; nsis on Windows
 ```

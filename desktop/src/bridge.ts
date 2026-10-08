@@ -6,5 +6,6 @@ export async function call<T>(method:string,params:unknown={}):Promise<T>{
   const reply=await r.json();if(!reply.ok)throw new Error(reply.error);return reply.result;
 }
 export async function shell<T>(command:string,args:Record<string,unknown>={}):Promise<T>{
-  if(!native)throw new Error('Esta ação está disponível no app instalado.');return invoke<T>(command,args);
+  if(native)return invoke<T>(command,args);
+  const r=await fetch('/shell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command,args})});const reply=await r.json();if(!reply.ok)throw new Error(reply.error);return reply.result;
 }

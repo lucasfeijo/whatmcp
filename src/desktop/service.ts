@@ -10,6 +10,7 @@ import { mediaPath } from '../transcription/media.ts';
 import { configSnapshot, saveSettings } from './settings.ts';
 import { seedDemo, demoVector } from './demo.ts';
 import { closeStores } from '../store.ts';
+import { setupReadiness } from './readiness.ts';
 
 const query=z.object({query:z.string().trim().min(1).max(2000),mode:z.enum(['hybrid','bm25','vector']).default('hybrid'),thread:z.string().max(300).optional(),sender:z.string().max(300).optional(),threadId:z.string().max(300).optional(),senderId:z.string().max(300).optional(),after:z.number().int().optional(),before:z.number().int().optional(),kind:z.enum(['all','text','audio']).default('all'),limit:z.number().int().min(1).max(100).default(40)}).strict();
 type Job={id:string;kind:string;messageId?:string;retry?:boolean;state:'running'|'done'|'failed'|'cancelled'|'interrupted';startedAt:number;finishedAt?:number;detail:string;done?:number;total?:number;};
@@ -65,6 +66,7 @@ export class DesktopService {
       case 'media':{
         const id=z.string().max(500).parse(p.id),cfg=this.cfg(),db=openStoreRO(cfg.store);try{const row=db.prepare('SELECT source_id,relative_path FROM audio_media WHERE message_id=?').get(id) as any;if(!row)throw new Error('Audio file is unavailable');const file=mediaPath(cfg,row);if(statSync(file).size>25_000_000)throw new Error('Audio playback is limited to 25 MB');const bytes=readFileSync(file);return {base64:bytes.toString('base64'),mime:/\.wav$/i.test(file)?'audio/wav':/\.ogg$/i.test(file)?'audio/ogg':'audio/mp4'};}finally{db.close();}
       }
+      case 'setup-readiness':return setupReadiness(this.cfg(),this.demo);
       case 'settings':return {...configSnapshot(CONFIG_PATH),configPath:CONFIG_PATH,platform:process.platform,demo:this.demo};
       case 'save-settings':if(this.active)throw new Error('Wait for the current job before changing settings');if(this.demo&&('openai_model' in p.patch||'openai_dims' in p.patch))throw new Error('The demo uses its own synthetic vector model');return saveSettings(CONFIG_PATH,p.patch,z.string().parse(p.revision));
       case 'grant-capture':this.leaseEnd=Date.now()+5*60_000;this.leaseDeadline=performance.now()+5*60_000;return {expiresAt:this.leaseEnd};

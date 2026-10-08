@@ -9,7 +9,7 @@
     "tauri": "tauri",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "build:desktop": "npm run prepare:runtime && tauri build",
-    "test": "node --experimental-sqlite --experimental-strip-types --no-warnings --test ../test/desktop.test.ts"
+    "test": "node --experimental-sqlite --experimental-strip-types --no-warnings --test ../test/desktop.test.ts ../test/desktop-profile.test.ts ../test/desktop-setup.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.1",

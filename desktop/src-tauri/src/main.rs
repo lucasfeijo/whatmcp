@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod onboarding;
+use onboarding::Onboarding;
 use serde_json::{json, Value};
 use std::{io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, process::{Child, ChildStdin, ChildStdout, Command, Stdio}, sync::{Arc, Mutex}, time::Duration};
 use tauri::{Emitter, Manager};
@@ -16,7 +18,7 @@ impl Backend {
     }
     fn stop(&mut self){let _=self.ask("shutdown",json!({}));let _=self.child.kill();let _=self.child.wait();}
 }
-struct Desktop { backend:Mutex<Option<Backend>>, resources:PathBuf, data:PathBuf, source_home:String, updating:Mutex<bool> }
+struct Desktop { backend:Mutex<Option<Backend>>, resources:PathBuf, data:PathBuf, source_home:String, onboarding:Mutex<Onboarding>, updating:Mutex<bool> }
 type Shared=Arc<Desktop>;
 fn spawn_backend(state:&Desktop,mode:&str,root:&Path)->Result<Backend,String>{
     std::fs::create_dir_all(state.data.join("runtime-home/tmp")).map_err(|e|e.to_string())?;
@@ -34,6 +36,25 @@ fn spawn_backend(state:&Desktop,mode:&str,root:&Path)->Result<Backend,String>{
     let mut child=cmd.current_dir(&runtime).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e|format!("Cannot start bundled archive runtime: {e}"))?;
     Ok(Backend{mode:mode.into(),root:root.into(),input:child.stdin.take().ok_or("Missing runtime input")?,output:BufReader::new(child.stdout.take().ok_or("Missing runtime output")?),child})
 }
+fn profile_path(folder:&str,home:&str)->PathBuf {
+    let folder=folder.trim();
+    if folder=="~" {PathBuf::from(home)}
+    else if let Some(relative)=folder.strip_prefix("~/") {PathBuf::from(home).join(relative)}
+    else {PathBuf::from(folder)}
+}
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    #[test]
+    fn expands_only_current_user_home() {
+        let home=std::env::temp_dir().join("whatmcp-fixture-home");
+        let text=home.to_str().unwrap();
+        assert_eq!(profile_path("  ~/.whatmcp  ",text),home.join(".whatmcp"));
+        assert_eq!(profile_path("~",text),home);
+        assert_eq!(profile_path("~other/.whatmcp",text),PathBuf::from("~other/.whatmcp"));
+        assert_eq!(profile_path(text,text),home);
+    }
+}
 fn overview(state:&Desktop)->Result<Value,String>{state.backend.lock().map_err(|_|"Runtime unavailable")?.as_mut().ok_or("Runtime unavailable")?.ask("overview",json!({}))}
 #[tauri::command]
 async fn archive_call(state:tauri::State<'_,Shared>,method:String,params:Value)->Result<Value,String>{
@@ -46,10 +67,29 @@ async fn switch_profile(state:tauri::State<'_,Shared>,mode:String,folder:Option<
         let flag=state.updating.lock().map_err(|_|"Update unavailable")?;if *flag {return Err("Update in progress".into())}
         let mut backend=state.backend.lock().map_err(|_|"Runtime unavailable")?;
         if let Some(current)=backend.as_mut(){let status=current.ask("overview",json!({}))?;if status["jobs"].as_array().map(|a|a.iter().any(|j|j["state"]=="running")).unwrap_or(false){return Err("Finish or cancel the current job before switching profiles".into())}}
-        let root=if mode=="existing"{let path=PathBuf::from(folder.ok_or("Select a profile folder")?);if !path.is_absolute()||!path.join("config.json").is_file(){return Err("Select an existing WhatMCP folder containing config.json".into())}path.canonicalize().map_err(|e|e.to_string())?}else{let path=state.data.join("profiles").join(&mode);std::fs::create_dir_all(&path).map_err(|e|e.to_string())?;path};
+        let root=if mode=="existing"{let path=profile_path(&folder.ok_or("Selecione a pasta do arquivo WhatMCP")?,&state.source_home);if !path.is_absolute()||!path.join("config.json").is_file(){return Err("Selecione uma pasta WhatMCP existente que contenha config.json".into())}path.canonicalize().map_err(|e|e.to_string())?}else{let path=state.data.join("profiles").join(&mode);std::fs::create_dir_all(&path).map_err(|e|e.to_string())?;path};
         // Probe the new runtime before replacing the current one; no migrations for existing.
         let mut next=spawn_backend(&state,&mode,&root)?;let info=match next.ask("overview",json!({})){Ok(v)=>v,Err(e)=>{next.stop();return Err(e)}};
+        let mut prefs=state.onboarding.lock().map_err(|_|"Configuração indisponível")?;let mut selected=prefs.clone();selected.profile(&mode,&root);
+        if let Err(error)=selected.save(&state.data){next.stop();return Err(error)}*prefs=selected;
         if let Some(old)=backend.as_mut(){old.stop()}*backend=Some(next);Ok(info)
+    }).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+fn onboarding_state(state:tauri::State<'_,Shared>)->Result<Value,String>{let prefs=state.onboarding.lock().map_err(|_|"Configuração indisponível")?;let mut value=serde_json::to_value(&*prefs).map_err(|e|e.to_string())?;value["warning"]=json!(prefs.warning);Ok(value)}
+#[tauri::command]
+async fn onboarding_action(state:tauri::State<'_,Shared>,action:String,step:Option<u8>)->Result<Value,String>{
+    let state=state.inner().clone();tauri::async_runtime::spawn_blocking(move||{
+        let flag=state.updating.lock().map_err(|_|"Configuração indisponível")?;if *flag{return Err("Uma atualização está em andamento".into())}
+        let mut backend=state.backend.lock().map_err(|_|"Arquivo indisponível")?;
+        let mut prefs=state.onboarding.lock().map_err(|_|"Configuração indisponível")?;let mut next=prefs.clone();
+        match action.as_str(){
+            "demo"=>{if next.mode!="demo"{return Err("Abra a demonstração primeiro".into())}next.choice="demo".into();next.complete=false;next.step=0;},
+            "begin"=>{next.choice="setup".into();next.complete=false;if next.mode=="demo"{next.step=0}},
+            "step"=>{if next.choice!="setup"{return Err("Inicie a configuração primeiro".into())}let step=step.ok_or("Etapa não informada")?;if step>3||(step>0&&next.mode=="demo"){return Err("Selecione seu arquivo antes de continuar".into())}next.step=step;},
+            "finish"=>{let current=backend.as_mut().ok_or("Arquivo indisponível")?;if current.mode=="demo"{return Err("A demonstração não conclui a configuração".into())}current.ask("settings",json!({}))?;if !current.root.join("config.json").is_file(){return Err("Salve a configuração antes de concluir".into())}next.choice="ready".into();next.complete=true;next.step=3;},
+            _=>return Err("Ação de configuração desconhecida".into()),
+        }next.warning=None;next.save(&state.data)?;*prefs=next;serde_json::to_value(&*prefs).map_err(|e|e.to_string())
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
@@ -91,9 +131,11 @@ fn main(){
         let resources=if cfg!(debug_assertions){PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources")}else{app.path().resource_dir()?};
         let data=std::env::var_os("WHATMCP_DESKTOP_DATA").map(PathBuf::from).unwrap_or(app.path().app_data_dir()?);
         let source_home=std::env::var("HOME").or_else(|_|std::env::var("USERPROFILE")).unwrap_or_default();
-        let state=Arc::new(Desktop{backend:Mutex::new(None),resources,data,source_home,updating:Mutex::new(false)});
-        let root=state.data.join("profiles/demo");std::fs::create_dir_all(&root)?;let backend=spawn_backend(&state,"demo",&root).map_err(std::io::Error::other)?;
+        let prefs=Onboarding::load(&data);
+        let state=Arc::new(Desktop{backend:Mutex::new(None),resources,data,source_home,onboarding:Mutex::new(prefs.clone()),updating:Mutex::new(false)});
+        let restored=(||->Result<Backend,String>{let (mode,root)=prefs.selected(&state.data)?;if mode!="existing"{std::fs::create_dir_all(&root).map_err(|e|e.to_string())?}let mut runtime=spawn_backend(&state,&mode,&root)?;if let Err(error)=runtime.ask("overview",json!({})){runtime.stop();return Err(error)}Ok(runtime)})();
+        let backend=match restored{Ok(runtime)=>runtime,Err(error)=>{let root=state.data.join("profiles/demo");std::fs::create_dir_all(&root)?;*state.onboarding.lock().unwrap()=Onboarding{choice:"setup".into(),warning:Some(error),..Onboarding::default()};spawn_backend(&state,"demo",&root).map_err(std::io::Error::other)?}};
         *state.backend.lock().unwrap()=Some(backend);app.manage(state);Ok(())
-    }).invoke_handler(tauri::generate_handler![archive_call,switch_profile,open_fda_settings,update_info,check_update,install_update])
+    }).invoke_handler(tauri::generate_handler![archive_call,switch_profile,onboarding_state,onboarding_action,open_fda_settings,update_info,check_update,install_update])
     .build(tauri::generate_context!()).expect("Unable to initialize WhatMCP").run(|app,event|{if matches!(event,tauri::RunEvent::Exit){let state=app.state::<Shared>();if let Ok(mut runtime)=state.backend.lock(){if let Some(runtime)=runtime.as_mut(){runtime.stop()}};}});
 }
