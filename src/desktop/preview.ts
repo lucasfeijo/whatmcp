@@ -7,7 +7,7 @@ const service=new DesktopService();
 let state={version:1,choice:'welcome',step:0,complete:false,mode:'demo',folder:null as string|null};
 async function fixtureCall(method:string,params:any={}) {
   const result:any=await service.call(method,params);
-  if(method==='overview'||method==='settings')return {...result,demo:state.mode==='demo',...(method==='overview'?{profile:state.mode==='demo'?process.env.WHATMCP_HOME:'/synthetic/app-archive'}:{})};
+  if(method==='overview'||method==='settings')return {...result,demo:state.mode==='demo',...(method==='overview'?{profile:state.mode==='demo'?process.env.WHATMCP_HOME:state.mode==='existing'?'/synthetic-existing':'/synthetic/app-archive'}:{})};
   return result;
 }
 async function fixtureShell(command:string,args:any={}) {
