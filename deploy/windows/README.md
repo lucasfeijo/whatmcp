@@ -35,3 +35,24 @@ preserved-copy support from https://github.com/caduosmarini/WAren6,
 starting at commit `e53aa64`; use `3fd7f19` or newer for fast quoted-message
 unification. Keep that repository as the WAren6 dependency;
 https://github.com/MayukXT/WAren6 remains its upstream project.
+
+## Desktop 0.3.0: Windows verbatim-path repair
+
+Some Windows launch contexts supply the Node entrypoint with a `\\?\` prefix.
+The bundled Node 22 runtime can exit before loading the backend with
+`EISDIR: illegal operation on a directory, lstat 'C:'`; the UI then shows pipe error 232.
+The source fix in `desktop/src-tauri/src/main.rs` normalizes the Node entrypoint and
+selected profile only on Windows. Other platforms retain the original paths.
+
+For an already installed Windows app, close the desktop window and run:
+
+```powershell
+.\scripts\repair-desktop-windows.ps1 -InstallDir "$env:LOCALAPPDATA\WhatMCP"
+```
+
+This builds a Windows-only bootstrap locally using the existing .NET Framework
+compiler. The bootstrap is unsigned and must be explicitly approved by the owner.
+The original signed Node executable remains intact as `bin/node.original.exe`.
+Private stdin/stdout IPC and the Node exit status are preserved. No services,
+schedulers, archive contents, provider keys or macOS files are changed.
+A future native desktop build containing the Rust fix no longer needs the bootstrap.

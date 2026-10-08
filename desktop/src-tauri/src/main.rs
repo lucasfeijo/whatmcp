@@ -20,14 +20,36 @@ impl Backend {
 }
 struct Desktop { backend:Mutex<Option<Backend>>, resources:PathBuf, data:PathBuf, source_home:String, onboarding:Mutex<Onboarding>, updating:Mutex<bool> }
 type Shared=Arc<Desktop>;
+// Windows canonical paths use a verbatim prefix that Node's TypeScript entrypoint
+// resolution cannot consume. Preserve native paths for Rust, but remove that
+// prefix at the Node boundary. Other platforms and Windows device paths are unchanged.
+fn node_path(path:&Path)->PathBuf {
+    #[cfg(windows)] {
+        use std::{ffi::OsString, os::windows::ffi::{OsStrExt,OsStringExt}, path::{Component,Prefix}};
+        let units:Vec<u16>=path.as_os_str().encode_wide().collect();
+        match path.components().next() {
+            Some(Component::Prefix(prefix))=>match prefix.kind() {
+                Prefix::VerbatimDisk(_)=>return PathBuf::from(OsString::from_wide(&units[4..])),
+                Prefix::VerbatimUNC(_,_)=>{
+                    let mut normalized=vec![b'\\' as u16,b'\\' as u16];
+                    normalized.extend_from_slice(&units[8..]);
+                    return PathBuf::from(OsString::from_wide(&normalized));
+                }
+                _=>{}
+            },
+            _=>{}
+        }
+    }
+    path.to_path_buf()
+}
 fn spawn_backend(state:&Desktop,mode:&str,root:&Path)->Result<Backend,String>{
     std::fs::create_dir_all(state.data.join("runtime-home/tmp")).map_err(|e|e.to_string())?;
     let bin=state.resources.join("bin");let runtime=state.resources.join("runtime");
     let mut cmd=Command::new(bin.join(if cfg!(windows){"node.exe"}else{"node"}));
-    cmd.args(["--experimental-sqlite","--experimental-strip-types","--no-warnings"]).arg(runtime.join("src/desktop/server.ts"));
+    cmd.args(["--experimental-sqlite","--experimental-strip-types","--no-warnings"]).arg(node_path(&runtime.join("src/desktop/server.ts")));
     // Drop inherited WHATMCP/API overrides. Only the explicitly selected profile applies.
     for (key,_) in std::env::vars(){if key.starts_with("WHATMCP_")||["OPENAI_API_KEY","NODE_OPTIONS","NODE_PATH"].contains(&key.as_str()){cmd.env_remove(key);}}
-    cmd.env("WHATMCP_HOME",root).env("WHATMCP_DESKTOP_MODE",mode)
+    cmd.env("WHATMCP_HOME",node_path(root)).env("WHATMCP_DESKTOP_MODE",mode)
        .env("HOME",state.data.join("runtime-home")).env("USERPROFILE",state.data.join("runtime-home")).env("TMPDIR",state.data.join("runtime-home/tmp"))
        .env("TMP",state.data.join("runtime-home/tmp")).env("TEMP",state.data.join("runtime-home/tmp"))
        .env("WHATMCP_USER_HOME",&state.source_home).env("WHATMCP_COLLECTOR",bin.join("macos-collector"))
@@ -45,6 +67,22 @@ fn profile_path(folder:&str,home:&str)->PathBuf {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn node_paths_remove_only_filesystem_verbatim_prefixes() {
+        assert_eq!(node_path(Path::new(r"\\?\C:\Users\Carlos Silva\runtime\server.ts")),PathBuf::from(r"C:\Users\Carlos Silva\runtime\server.ts"));
+        assert_eq!(node_path(Path::new(r"\\?\UNC\server\share\arquivo\config.json")),PathBuf::from(r"\\server\share\arquivo\config.json"));
+        for path in [r"C:\Users\Carlos Silva\.whatmcp",r"\\server\share\arquivo",r"relative\server.ts",r"\\?\Volume{1234}\arquivo",r"\\.\pipe\whatmcp"] {
+            assert_eq!(node_path(Path::new(path)),PathBuf::from(path));
+        }
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn node_paths_are_unchanged_outside_windows() {
+        for path in ["/Users/carlos/Library/Application Support/WhatMCP",r"\\?\C:\runtime\server.ts",r"\\?\UNC\server\share\arquivo","relative/server.ts"] {
+            assert_eq!(node_path(Path::new(path)),PathBuf::from(path));
+        }
+    }
     #[test]
     fn expands_only_current_user_home() {
         let home=std::env::temp_dir().join("whatmcp-fixture-home");
