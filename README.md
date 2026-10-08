@@ -1,506 +1,245 @@
 # WhatMCP
 
-Windows users with an iPhone-backup archive: see [Windows integration](docs/WINDOWS.md)
-for the WAren6 dependency, incremental import, security limitations, and
-opt-in scheduling.
+A desktop app and MCP server for browsing, searching, and preserving your WhatsApp history in a local archive.
 
-A local MCP server over a local, durable archive of your WhatsApp history.
+Find a conversation by a phrase, a person, or a topic. Read the surrounding messages,
+listen to archived audio, and give an MCP client access to the same history.
+The archive lives outside the application and keeps messages already imported,
+even when they disappear from the source database.
 
-See the [changelog](CHANGELOG.md) for changes in this fork.
+[Quick start](#quick-start) · [Documentation](#documentation) · [Desktop builds](https://github.com/lucasfeijo/whatmcp/actions/workflows/desktop-build.yml) · [Changelog](CHANGELOG.md)
 
-Requires **Node.js >= 22.6**. Install the project, then choose a source:
+![WhatMCP desktop showing a conversation and its archived audio](docs/screenshots/desktop-setup/08-finished.png)
+
+<sub>The desktop UI is currently in Portuguese. This screenshot uses synthetic demonstration data.</sub>
+
+## What you can do
+
+- **Find past conversations.** Search by text, meaning, or both; narrow results by
+  conversation, sender, date, or message type, then open the surrounding context.
+- **Browse your history.** Navigate conversations, jump to a date, play available
+  audio, and read or request transcripts.
+- **Manage processing.** Start sync, transcription, and embedding jobs; see pending
+  audio, missing media, and unembedded segments; follow progress, cancel, or retry.
+- **Set up through the app.** Try the demo, create an app-owned archive, or select
+  an existing profile. Change supported configuration fields in Settings.
+- **Connect your tools.** Use the CLI or an MCP client to search messages, find
+  people, read threads, and review archive coverage.
+
+Text search works without a provider key. Real semantic search sends conversation
+windows and search queries to OpenAI. Optional cloud transcription sends audio;
+Apple and local Whisper transcription process audio on your computer.
+
+## Quick start
+
+### Desktop app
+
+Download an installer artifact from a successful run of
+[Desktop installers](https://github.com/lucasfeijo/whatmcp/actions/workflows/desktop-build.yml):
+macOS ARM64 `.dmg` or Windows x64 `.exe`. GitHub requires sign-in to download
+workflow artifacts. The app includes Node and its backend; end users do not need
+Node, Rust, or Xcode.
+
+On first launch, choose **Explore the demo** or **Configure my WhatsApp**. The
+wizard selects an archive, explains source access, saves optional search/audio
+settings, and offers a first sync. Demo mode keeps a visible link back to setup.
+
+The app uses manual sync and does not install a LaunchAgent or Windows task.
+You do not need `npm run setup` for this flow. Existing CLI schedulers remain
+independent. Builds have no Developer ID/notarization or Windows Authenticode
+signature; OS installation prompts and live source access still need platform
+validation. See the [desktop guide](desktop/README.md) for requirements and limits.
+
+### Run the demo from source
+
+Use **Node.js 22.23.2**, the version used in CI. No API key, WhatsApp installation,
+or native build is needed for the browser demo. These commands use a POSIX shell;
+Windows users can run them in Git Bash.
 
 ```sh
-git clone https://github.com/pedroschott/whatmcp.git
+git clone https://github.com/lucasfeijo/whatmcp.git
 cd whatmcp
-npm install
+npm ci
+npm ci --prefix desktop
 ```
 
-| Source | Setup |
-|---|---|
-| WhatsApp Desktop on macOS | Sign in to WhatsApp Desktop, then run `npm run setup`. |
-| WhatsApp Desktop on Windows | Configure the separate [WAren6 source](docs/WINDOWS.md) and choose a local or OpenAI transcription model. |
-| A compatible `ChatStorage.sqlite` file on Windows or macOS | Use the [file import commands](docs/IMPORT.md). |
-| An existing WhatMCP archive | Set `WHATMCP_STORE` to the archive path. See [archive configuration](docs/IMPORT.md#use-an-existing-archive). |
+Start the synthetic backend:
 
-To recover older messages from an iPhone backup, follow
-[Import iPhone history](docs/IPHONE.md), then use the prepared file as the source.
-
-Indexing, embedding, search, and the MCP servers use Node.js and SQLite. The
-macOS/file source reader expects the WhatsApp Core Data schema; the Windows
-adapter imports WAren6's validated unified database. A file import does not
-require WhatsApp to be installed on the computer that runs WhatMCP.
-
-The guided setup accepts a compatible SQLite file on Windows, or the separate
-WAren6 adapter for the native Windows app. Windows hot-copy scheduling keeps
-WhatsApp open; see [Windows integration](docs/WINDOWS.md).
-
-For macOS Desktop setup, `npm run setup` checks permissions, prompts for an API
-key, and builds the archive. It shows the estimated embedding cost before asking
-to proceed. Audio transcription is optional; see [Audio transcription](docs/AUDIO.md).
-
-<img width="653" height="381" alt="file-e6e5a56497e3ab9e15559e8d93e58d4c" src="https://github.com/user-attachments/assets/6ee373f8-84c0-4f94-b8ec-d1d5e52d2ec3" />
-
-> **macOS Full Disk Access:** grant access to the app that launches WhatMCP, such
-> as your terminal or MCP client. This is required to read the protected WhatsApp
-> Desktop database. `npm run setup` and `npm run doctor` check this access.
-
-The archive, vectors, index, and search stay on this computer. **Conversation
-text is sent to OpenAI for embeddings** when embedding is enabled, as is each
-semantic search query. Audio transcription is off by default. Choosing
-`gpt-transcribe` explicitly sends accessible audio files to OpenAI; the two
-Apple models run locally on a supported Mac. `faster-whisper` runs locally with
-an installed Python environment and cached Whisper model, including on Windows.
-Transcript text included in a
-conversation window is also sent when that window is embedded.
-
-```
-WhatsApp Desktop (macOS) or a compatible database file
-  ChatStorage.sqlite ──snapshot──> normalize ──> conversation windows ──> FTS5
-                                                          │                 │
-                                                          └──> OpenAI ──> vectors
-                                                                              │
-                                                    ~/.whatmcp/archive.db ────┘
-                                                                              │
-                                                          MCP over stdio ─────┤
-                                                                              ▼
-                                                     Claude Desktop · Claude Code
+```sh
+WHATMCP_HOME="$PWD/.ci-sandbox/demo" WHATMCP_DESKTOP_MODE=demo OPENAI_API_KEY='' \
+  node --experimental-sqlite --experimental-strip-types --no-warnings src/desktop/preview.ts
 ```
 
-## Why windows, not messages
+In another terminal, from the same checkout:
 
-The central design decision. Real message history looks like this:
-
-```
-Alex:   nope
-Sam:    anyone have the link for tomorrow
+```sh
+npm run dev --prefix desktop
 ```
 
-`"nope"` is meaningless as a retrieval unit — for BM25, and *especially* for an
-embedding model. A large fraction of any chat history is `ok`, `lol`, `yeah`,
-`k`. The signal lives in the burst, not in the message.
+Open [localhost:1420](http://127.0.0.1:1420) and choose the demo. Its messages,
+semantic vectors, transcription, and sync are synthetic. The preview uses only
+the demo profile, even when navigating the wizard; it cannot open your real archive
+or grant OS permissions. Stop both processes with Ctrl+C when finished.
 
-So messages are grouped into **conversation windows**: consecutive messages in one
-thread with no silence longer than 30 minutes, rendered with speaker labels. On
-this corpus:
+## Usage
 
-| | |
-|---|---|
-| messages archived | 97,195 |
-| conversation windows | 11,475 |
-| chats | 1,071 |
-| span | Oct 2017 → today |
-| full index time | ~2s |
+In the desktop app, **Buscar** searches the archive, **Conversas** opens threads,
+**Atividade** manages jobs and backlogs, and **Ajustes** edits settings or reopens
+the guided setup.
 
-Those 11,475 windows are coherent, self-contained, and genuinely searchable.
+With a configured CLI archive, search for a phrase or list conversations:
 
-The model is **retrieval-to-navigate, not retrieval-to-answer**. `search_messages`
-gets the agent to the right neighbourhood; `get_conversation` expands any hit into
-the full transcript. The reading model does the reasoning.
-
-## Archive, not cache
-
-<img width="478" height="289" alt="image" src="https://github.com/user-attachments/assets/6c5b23bb-0645-4238-b6f0-65ad76bf27fa" />
-
-
-WhatsApp Desktop prunes its own local store, and unlinking the device can empty it
-outright. After a while this archive holds messages that exist nowhere else on the
-machine, so several properties are deliberate rather than incidental:
-
-- **Nothing ever deletes a message row.** `index --full` re-reads the entire
-  WhatsApp store and *upserts*; it does not truncate first.
-- **Messages are keyed by wire id, not by rowid.** `{chat_jid}:{stanza_id}`
-  survives a WhatsApp store rebuild, so re-syncing an emptied WhatsApp against a
-  full archive is idempotent instead of duplicating everything.
-- **A source reset is detected.** If WhatsApp's `Z_PK` counter goes *backwards*,
-  the device was re-linked; an incremental run would then match nothing and report
-  success forever, so it escalates to a full pass automatically.
-- **The archive lives in `~/.whatmcp/`,** outside this repo. Deleting a checkout
-  must not delete nine years of history.
-
-## Search
-
-Hybrid: BM25 (FTS5) fused with dense vectors by Reciprocal Rank Fusion. Neither
-arm suffices alone — BM25 owns names, numbers and texting shorthand the encoder
-never saw (`idk`, `ttyl`, `lmk` subword-shatter into noise); vectors own
-paraphrase and cross-lingual recall.
-
-**It works in any language, and across them.** The embedding model is
-multilingual, so a question asked in one language retrieves conversations held in
-another — useful for the common case of an English-speaking assistant searching
-chats that are not in English. The keyword arm is language-agnostic by
-construction; only the stopword list is tuned, and extending it is a one-line
-change.
-
-**Results are labelled, not silently filtered.** Cosine similarity on a personal
-corpus does not separate relevant from irrelevant in absolute terms — a genuine
-cross-lingual question can score below outright nonsense, because both are far
-from everything. Any threshold strict enough to block the nonsense also blocks the
-cross-lingual questions that justify having embeddings at all. So every hit is
-marked `strong` (keywords corroborate it, or similarity clears the measured noise
-ceiling) or `WEAK`, and the tool says outright when nothing it found is
-corroborated.
-
-Thresholds are **measured, not guessed** — `wa calibrate` embeds queries about
-subjects guaranteed absent from a personal history, records how similar the
-corpus's best match to that nonsense is, and writes the fitted values to config.
-Copying another project's constants is how this breaks silently: E5-family models
-put unrelated text near 0.75 cosine, `text-embedding-3-small` near 0.10.
-
-## Setup
-
-Use [file import](docs/IMPORT.md) for a database file on Windows or macOS.
-Use the guided setup below for the live macOS WhatsApp Desktop database.
-
-### macOS Desktop setup
-
-```bash
-npm run setup
+```sh
+npm run wa -- search "invoice" --mode=bm25
+npm run wa -- search "payment arrangements" --chat="Project" --mode=hybrid
+npm run wa -- chats
+npm run wa -- conversation "thread-id-from-chats"
 ```
 
-That walks through permissions, the API key, the first index and embed (with the
-cost shown before you agree), threshold calibration, and background sync.
+Keyword search needs no API key. Hybrid and vector search require embeddings and
+a configured OpenAI key. CLI commands default to `~/.whatmcp`; set `WHATMCP_HOME`
+to the selected desktop profile when using the same archive.
 
-Prefer to do it by hand, or scripting it:
+For an MCP client, launch the stdio server with `npm run serve` or configure the
+Node entry point in the client. Start with `search_messages`, then use
+`get_conversation` to read a hit in context. `list_messages_since` provides a
+chronological, paginated feed without relevance ranking or embeddings.
+See [CLI and MCP usage](docs/USAGE.md) for setup, client configuration, all nine
+tools, recurring reviews, scheduling, and backups.
 
-```bash
-npm run wa -- set-key          # hidden prompt; stored 0600 in ~/.whatmcp/config.json
-npm run sync                   # index + embed
-npm run wa -- calibrate        # fit similarity thresholds to this corpus
-npm run wa -- sync-every 6     # background sync every 6h (0 disables)
-npm run doctor                 # verify everything
+## How it works
+
+WhatMCP reads a supported source into its own SQLite archive. Consecutive messages
+in each chat become conversation windows, preserving the context that a short
+message such as “yes” lacks on its own. Text search uses SQLite FTS5; optional
+embeddings add semantic search, with the rankings combined for hybrid results.
+
+```mermaid
+flowchart LR
+  S[Supported WhatsApp source] --> I[Import / sync]
+  I --> A[Local SQLite archive]
+  A --> W[Conversation windows]
+  W --> F[FTS5 text index]
+  W -. Optional: sends text .-> E[OpenAI embeddings]
+  E --> V[Stored vectors]
+  F --> R[Search + conversation context]
+  V --> R
+  A --> R
+  R --> D[Desktop app]
+  R --> C[CLI / MCP clients]
 ```
 
-For automation, redirect a protected file or pipe a secret manager into
-`npm run wa -- set-key`. Keys supplied as command-line arguments are refused so
-they cannot land in shell history or the process list.
+The desktop shell is **React + Tauri 2**, backed by bundled **Node 22 and SQLite**.
+Its production backend uses private stdin/stdout through allowlisted Rust commands;
+opening the app starts no HTTP or MCP listener. CLI MCP transports are separate:
+stdio by default, or opt-in Streamable HTTP with authentication.
 
-Check it works before wiring up a client:
+Imports upsert stable message IDs rather than replacing the archive. Changed
+conversation windows get new content hashes; embedding work resumes from what is
+missing. Search exposes strong/weak match labels so similarity is not mistaken for
+evidence. See [architecture and data guarantees](docs/ARCHITECTURE.md) for the
+retrieval, persistence, and security decisions.
 
-```bash
-npm run wa -- search "something you talked about"
+## Configuration
+
+The selected profile holds `config.json`, `archive.db`, media, and job history.
+Desktop profiles live under the platform's application data directory; the CLI
+defaults to `~/.whatmcp`. Selecting a legacy profile is explicit and does not copy
+or migrate it. Jobs and Settings then write to that selected profile.
+
+| CLI / MCP variable | Purpose |
+| --- | --- |
+| `WHATMCP_HOME` | Profile directory containing configuration and the default archive |
+| `WHATMCP_STORE` | Override the destination archive, or select an existing archive |
+| `WHATMCP_CHATSTORAGE` | Override the compatible source SQLite file |
+| `OPENAI_API_KEY` | Override the saved provider key for this process |
+
+Environment overrides apply to CLI/MCP processes. The packaged app selects and
+remembers its own profile instead of inheriting these overrides. For the CLI,
+`npm run wa -- set-key` prompts without echoing the key and saves it in
+`config.json`; avoid putting credentials in arguments or MCP client files.
+
+Choose the source instructions that match your data:
+
+- [macOS desktop app and FDA](desktop/README.md#macos-collection-and-fda)
+- [Windows Desktop with the external WAren6 adapter](docs/WINDOWS.md)
+- [Compatible SQLite file or existing archive](docs/IMPORT.md)
+- [Prepared iPhone-backup history](docs/IPHONE.md)
+- [Apple, local Whisper, or OpenAI audio transcription](docs/AUDIO.md)
+
+## Privacy and limits
+
+WhatMCP reads WhatsApp; it cannot send messages, react, join, or leave chats.
+Sync writes to its own archive. Retrieved messages are untrusted data and are
+fenced in MCP responses. The archive is plaintext SQLite: protect the profile
+with OS permissions, disk encryption, and consistent backups.
+
+macOS Full Disk Access is a persistent permission granted by the user. The app's
+five-minute capture authorization is an application policy; it does not make FDA
+temporary. Archive browsing supports macOS 13+; Apple transcription needs macOS
+26+. Windows live capture requires a separately installed WAren6 adapter.
+FFmpeg/FFprobe and local Whisper/Python/models are external dependencies.
+
+Coverage depends on the available source history and media bytes. File imports
+are snapshots; sender names may be unavailable; reply threading is not supported.
+Incremental imports preserve archived messages and do not mirror source deletions.
+In-app updates remain disabled until a signed update feed is configured.
+Native permission attribution, unsigned installation/upgrade behavior, and real
+provider integration require platform tests beyond the synthetic demo and CI.
+
+## Development
+
+After the quick-start dependency installation, run checks from the repository root:
+
+```sh
+npm test -- --test-concurrency=2 --test-timeout=120000
+npm test --prefix desktop
+npm run build --prefix desktop
+cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
 ```
 
-### Scheduled sync on macOS
+`desktop` build checks TypeScript and builds the Vite frontend. There is no
+separate lint script. To build the installable app, use Rust **1.95.0** and the
+platform's native build tools; macOS helper compilation needs an **Xcode 26 SDK**:
 
-WhatsApp prunes its own local database, so anything it drops before your next
-sync is gone for good — `npm run setup` therefore installs a background sync
-every 6 hours by default. It is a LaunchAgent separate from the MCP server, so
-the archive keeps growing whether or not an AI client is running. Routine syncs
-cost fractions of a cent; a quiet interval costs nothing, since nothing new gets
-embedded.
-
-When a transcription model is enabled, the macOS LaunchAgent captures new messages
-first, transcribes up to 100 pending audio files, then runs sync to embed the
-published transcripts and capture messages that arrived during transcription.
-Set `"transcription_batch_size": 100` in `~/.whatmcp/config.json` to choose a
-positive integer limit per scheduled cycle. The default is 100; changes apply on
-the next cycle without reinstalling the agent. Manual `transcribe --limit` is independent.
-With transcription disabled it runs sync once as before. Transcription failures
-are logged and do not prevent the final message sync. Capture failures stop the
-cycle, and interrupted jobs do not start another stage.
-
-Scheduled, manual, MCP, and dashboard syncs run in a supervised child process.
-The supervisor stops a ChatStorage sync after 10 minutes by default (SIGTERM, then SIGKILL
-after 5 more seconds). Set `"sync_timeout_minutes": 10` in `~/.whatmcp/config.json`
-to choose a positive timeout in minutes. The same setting applies to CLI, MCP,
-dashboard, and scheduled sync. Opt-in automatic import transcription adds 45
-minutes to this base budget. The macOS scheduled pipeline keeps its separate
-bounded transcription stage and does not repeat it during capture or final sync.
-Windows hot-copy sync defaults to 30 minutes and stops
-the worker process tree on timeout. See [Windows setup](docs/WINDOWS.md). Only one sync can run at a time; overlapping
-requests are skipped immediately. After a timeout, scheduled attempts are paused
-instead of repeatedly waiting on a macOS permission prompt. Run `npm run sync`
-when you can respond to that prompt; a successful manual sync resumes the
-schedule. Previously archived messages remain in the archive.
-
-```bash
-npm run wa -- sync-every 12    # change the cadence
-npm run wa -- sync-every 0     # back to manual
-tail -f ~/.whatmcp/logs/sync.log
+```sh
+npm run prepare:runtime --prefix desktop
+npm run tauri --prefix desktop -- build --bundles app,dmg  # macOS
+# Windows: use --bundles nsis instead
 ```
 
-### Backing it up
+Use disposable HOME, temporary directories, caches, and `WHATMCP_HOME` for tests
+and native development. Keep real messages and credentials outside the checkout.
+Fixture CI runs on Ubuntu; installer CI produces macOS ARM64 and Windows x64
+artifacts. Read [CI workflows](.github/README.md) and the
+[desktop build guide](desktop/README.md#build-and-validation) before native builds
+or enabling the separately signed updater.
 
-Stop archive writers before backing up. If SQLite WAL files are present, use
-SQLite's backup API to make a consistent copy. For a closed archive with no
-pending WAL data, copy `archive.db`. For example, on macOS:
+## Project structure
 
-```bash
-cp ~/.whatmcp/archive.db ~/wherever/
+```text
+desktop/           React UI, Tauri shell, macOS collector, packaging scripts
+src/desktop/       Shared desktop backend, settings, job workers, synthetic demo
+src/whatsapp/      macOS / compatible ChatStorage source reader
+src/index/         Import, conversation windowing, embeddings, Windows adapter
+src/search/        Text/vector retrieval, conversations, people, timeline
+src/transcription/ Audio inventory, providers, resumable transcripts
+src/mcp/           Tool definitions, stdio/HTTP transports, OAuth, web dashboard
+src/db/            SQLite schema and migrations
+test/              Synthetic fixtures and regression tests
+docs/              Source setup, usage, architecture, and audio guides
 ```
 
-It is worth doing. After a while it holds messages WhatsApp itself no longer has.
+## Documentation
 
-## Connecting
+[Desktop app](desktop/README.md) · [CLI and MCP](docs/USAGE.md) · [Architecture](docs/ARCHITECTURE.md) · [Remote access](docs/REMOTE.md) · [File import](docs/IMPORT.md) · [Windows](docs/WINDOWS.md) · [iPhone history](docs/IPHONE.md) · [Audio](docs/AUDIO.md)
 
-Configure the client to launch `node` with the server path in your checkout.
-On Windows, use an absolute Windows path; escape backslashes as `\\` in JSON.
-The shell and Claude Desktop configuration path below are macOS examples.
+## Contributing and license
 
-**Claude Code**
+Open an [issue](https://github.com/lucasfeijo/whatmcp/issues) or pull request with
+the problem, proposed behavior, and relevant validation. Reproduce bugs with
+synthetic fixtures; keep private conversations, archives, and credentials out of
+reports and tests.
 
-```bash
-claude mcp add whatmcp -- node --experimental-sqlite --experimental-strip-types \
-  --no-warnings "$(pwd)/src/mcp/server.ts"
-```
-
-**Claude Desktop** — add to
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-`npm run setup` prints this block with your real paths already filled in.
-
-```json
-{
-  "mcpServers": {
-    "whatmcp": {
-      "command": "node",
-      "args": [
-        "--experimental-sqlite",
-        "--experimental-strip-types",
-        "--no-warnings",
-        "/absolute/path/to/WhatMCP/src/mcp/server.ts"
-      ]
-    }
-  }
-}
-```
-
-No API key goes in that file. A GUI-launched MCP server inherits none of your
-shell environment, which is exactly why the key lives in `~/.whatmcp/config.json`.
-
-### HTTP, for agents that need a URL
-
-> Full walkthrough, security model and troubleshooting: **[docs/REMOTE.md](docs/REMOTE.md)**
-
-Some agent frameworks can only talk to an endpoint. Stdio has no network surface
-at all, so prefer it when you can; use this when you can't.
-
-```bash
-npm run wa -- http-token       # 32 random bytes, stored 0600
-npm run serve:http             # http://127.0.0.1:8787/mcp
-```
-
-Call it with `Authorization: Bearer <token>`.
-
-**The token is a password to your entire history**, not an API key in the ordinary
-sense — it reads nine years of messages from everyone who ever wrote to you, most
-of whom never agreed to this archive existing. Three controls run on every
-request, in order:
-
-1. **Host allowlist** — defeats DNS rebinding, where a page you visit resolves an
-   attacker's domain to `127.0.0.1` and reads this server through your browser. A
-   bearer token alone does not stop that, so the check is independent of auth.
-2. **Origin rejection** — any `Origin` header means a browser sent it, and no
-   legitimate MCP client is a web page.
-3. **Constant-time token comparison**, minimum 32 characters, enforced at boot.
-   Authentication runs before JSON parsing, so unauthenticated callers cannot
-   make the server buffer the 4 MB MCP body allowance.
-
-`/health` is unauthenticated but returns nothing beyond liveness; message counts
-and date ranges need the token, since "50k messages going back to 2017" is itself
-information about you.
-
-### Dashboard
-
-<img width="1076" height="807" alt="file-15e5aefb383b38170ba8aa618328cf86" src="https://github.com/user-attachments/assets/721f529a-41e2-4a56-94a3-0dff07302a93" />
-
-
-With the HTTP server running, open **http://127.0.0.1:8787/** — live archive
-stats, freshness against WhatsApp, a *Sync now* button that streams progress, and
-a search box showing strong/weak labels with the underlying BM25 rank, vector
-similarity and term coverage.
-
-It has its own auth, deliberately separate from `/mcp`. That endpoint rejects any
-request carrying an `Origin` header, and a browser always sends one — so the
-dashboard cannot reuse it without loosening the strict rule. Instead the token is
-exchanged once for an opaque session id in an `HttpOnly; SameSite=Strict` cookie:
-the token never reaches `localStorage`, a URL, or anything a script can read, and
-a server restart invalidates every session. A custom request header is required on
-top, which no cross-origin form or `<img>` can set.
-
-**On rendering messages in a browser:** every string on that page came from a
-WhatsApp message, so it is attacker-controlled — anyone who knows your number can
-put `<script>` in your archive. The page never assigns data to `innerHTML`; all
-content goes in through `textContent`, and a strict CSP blocks external loads
-entirely. Run it with `WHATMCP_NO_DASHBOARD=1` to disable it outright.
-
-#### Remote deployment on macOS
-
-Do **not** simply bind `0.0.0.0`. This server does not terminate TLS, so traffic
-would carry the bearer token and every message it returns in cleartext, readable
-by anything on the path. Keep it on loopback and put a tunnel in front:
-
-```bash
-brew install cloudflared
-bash deploy/install.sh      # two LaunchAgents: server + tunnel
-npm run wa -- url           # the current public URL
-```
-
-`install.sh` is per-user and reversible — nothing needs sudo, nothing lands
-outside `~/Library/LaunchAgents` and `~/.whatmcp`, and `deploy/uninstall.sh`
-removes it without touching the archive.
-
-Three things it handles that are easy to miss:
-
-- **Sleep.** A sleeping Mac serves nothing, and this one sleeps after a minute.
-  The server runs under `caffeinate -is`, which needs no sudo but only covers AC
-  power. On battery macOS may still sleep; only `sudo pmset -b sleep 0` changes
-  that, and that one is yours to run.
-- **The dashboard does not go public.** A tunnel forwards to `127.0.0.1:8787`, so
-  everything on that port would otherwise be reachable from the internet the
-  moment it starts — including the login form. Dashboard routes require a
-  loopback `Host` header, so the tunnel's hostname gets a 404 while `/mcp` works.
-  Enforced in code, not by proxy configuration.
-- **The URL rotates.** A quick tunnel mints a new hostname on every reconnect,
-  which is why the Host check accepts the `.trycloudflare.com` suffix rather than
-  an exact name. For a stable hostname use a named tunnel (Cloudflare account
-  plus a domain) and put the exact host in `http_allowed_hosts` instead.
-
-A tunnel gives you TLS, no inbound firewall hole, and a URL you revoke by killing
-one process. If you bind a non-loopback address directly instead, the server
-starts but prints a loud warning — it does not pretend that is supported.
-
-The deployment scripts in this section require macOS. They use `launchd` and
-`caffeinate`. They do not install Windows services.
-
-Once public, **the bearer token is the only thing between the internet and the
-archive.** Rotate it with `npm run wa -- http-token` (restart the server after),
-and take the whole endpoint down with `bash deploy/uninstall.sh`.
-
-### ChatGPT / Claude App
-
-<img width="804" height="605" alt="file-9230d905315a60846f41531de5708a20" src="https://github.com/user-attachments/assets/18c867c0-5959-48b6-a20d-b0d65a925ea0" />
-
-
-ChatGPT and Claude refuses static bearer tokens: custom MCP connectors require OAuth with
-dynamic client registration and PKCE, and it will not do machine-to-machine
-grants. So the HTTP server ships an OAuth 2.1 authorization server
-(`src/mcp/oauth.ts`) alongside the static-token path, which keeps working
-unchanged for Claude Code and Claude Desktop.
-
-1. Get a **stable public hostname** — a rotating quick tunnel will not survive,
-   because a client registration is bound to fixed issuer and redirect URLs. Use a
-   named Cloudflare tunnel, then set `public_url` in `~/.whatmcp/config.json`.
-2. In ChatGPT: Settings → Connectors → Developer mode, add
-   `https://your-host/mcp`, and choose OAuth.
-3. ChatGPT registers itself, redirects you to `/authorize`, and you paste your
-   WhatMCP token to approve. It exchanges the code for an access token from then on.
-
-Inspect and revoke grants:
-
-```bash
-npm run wa -- oauth                    # registered clients, live token counts
-npm run wa -- oauth revoke <client_id> # kill every token for one client
-```
-
-The flow is standard and the guards are enforced, not assumed: PKCE S256 is
-mandatory (no `plain`), redirect URIs are matched exactly (prefix matching is how
-these become open redirects), codes are single-use with a 60-second TTL bound to
-client, redirect URI, challenge and resource, refresh tokens rotate on every use,
-and codes and tokens are stored only as SHA-256 hashes. Dynamic registration is
-rate-limited, size-bounded and globally capped; stale registrations are pruned.
-The consent page cannot be framed and is never cached.
-
-One thing to be clear-eyed about: `/authorize` is a **public HTML form that
-accepts your archive token** — the only deliberately public browser surface here.
-It is rate-limited with exponential lockout and leaks nothing about the archive,
-but it exists, which is why the dashboard stays loopback-only. OAuth grants carry
-only `whatmcp:read` and do not receive `sync_archive`; syncing remains available
-locally and to the operator's static token.
-
-## Tools
-
-| tool | purpose |
-|---|---|
-| `search_messages` | Hybrid semantic + keyword search over windows; filter by chat, sender, date |
-| `get_conversation` | Expand a thread, optionally centred on a timestamp |
-| `list_messages_since` | Enumerate individual messages by date across chats, with a resumable page cursor |
-| `list_chats` | Chats by recency, with counts and date ranges |
-| `find_people` | Resolve a name or phone number to who they are and where they talk |
-| `get_chat_summary` | Participants, volume and peak period for one chat |
-| `get_timeline` | Message volume over time, scoped by topic, person or chat |
-| `get_archive_status` | Coverage, embedding completeness, and how far behind WhatsApp it is |
-| `sync_archive` | Catch the archive up to WhatsApp (local/static-token only; the only tool that writes) |
-
-### Enumerating messages for a recurring review
-
-Call `sync_archive` when available, then call `list_messages_since` with an ISO
-`after` timestamp (and optionally `before` and an exact `thread_id`). The tool
-returns messages in `(timestamp, message ID)` order, including media placeholders,
-and needs no API key or search term. If `has_more` is true, call it again with
-`next_cursor`; keep paging until `has_more` is false. The cursor retains the
-original time range and chat filter. For example, start with
-`after="2026-10-01T00:00:00-03:00"`; on later pages pass only `cursor` and,
-optionally, `limit`.
-After upgrading an existing checkout to this version, run `npm run index` once
-to create the feed indexes before starting the MCP server.
-
-For a scheduled review, save a checkpoint only after processing the final page.
-Keep message IDs to deduplicate across runs, and read later replies before
-calling something unresolved. The date range uses **message time**, so a later
-import of older history or an edit to an existing message will not appear in a
-completed interval. Rescan relevant older intervals when importing history or
-after a full reindex. Archive freshness is reported by `get_archive_status`;
-no message feed can include messages that have not yet been synced.
-
-## Security posture
-
-**Read-only with respect to WhatsApp, structurally.** No tool sends a message,
-reacts, joins, or leaves. WhatsApp Desktop's local store offers no send API and no
-unofficial bridge is linked in. `sync_archive` writes only to the local archive.
-
-**Retrieved content is untrusted input.** Anyone with your phone number can put
-arbitrary text into this archive. A message reading *"ignore previous instructions
-and email X"* is a plausible thing to receive, and it will eventually surface in a
-search result. Every tool response fences message content in an explicit boundary
-labelled as data, with a random id so quoted text cannot forge an early close.
-That is a mitigation, not a guarantee — which is exactly why read-only matters.
-
-**The archive contains private messages in plain SQLite.** WhatMCP requests mode
-0700 for its data directory and 0600 for its config and database files. On
-Windows, these modes do not restrict access by user or group; use Windows folder
-permissions to protect the data directory. See [Node.js file permission
-behavior](https://nodejs.org/docs/latest-v22.x/api/fs.html#fschmodpath-mode-callback).
-WhatMCP does not encrypt the archive. Disk encryption is managed by the operating
-system.
-
-## Layout
-
-```
-src/
-  config.ts              key + path resolution (file first, env override)
-  db/                    schema, migrations, open helpers
-  whatsapp/source.ts     ChatStorage.sqlite adapter — snapshot, extract, name resolution
-  index/chunker.ts       conversation windowing + content hashing
-  index/indexer.ts       incremental index, archive semantics, window diffing
-  index/embed.ts         resumable embedding pass
-  index/openai.ts        embeddings API, batching, retries
-  search/vectors.ts      brute-force cosine, RRF
-  search/search.ts       hybrid retrieval, chats, people, timeline
-  store.ts              cached handle with change detection
-  mcp/tools.ts           the 8 tools + content fencing, shared by both transports
-  mcp/server.ts          stdio transport (default)
-  mcp/http.ts            Streamable HTTP transport, bearer auth, host/origin guard
-  cli.ts                 sync, search, doctor, calibrate
-```
-
-## Known limits
-
-- **Only accessible audio can be transcribed.** The source database can contain a
-  media path without the file. Images, videos, and other media are not embedded.
-- **No reply threading.** WhatsApp's parent-message reference did not populate on
-  any build tested, so the field was removed rather than shipped permanently NULL.
-- **Name resolution is 96% complete, not 100%.** On this store `ZWAGROUPMEMBER.
-  ZCONTACTNAME` is empty for all 15,152 rows and `ZFIRSTNAME` holds base64
-  protobuf, so names come from push names plus a cross-reference against DM
-  sessions. ~1,900 messages are from senders with no recoverable name and appear
-  under their raw `@lid`.
-- **Coverage depends on the source database.** The macOS Desktop database may
-  contain less history than the phone. A file import adds only the messages
-  present in that file.
-- **Incremental sync catches inserts, not deletes** — by design. Run
-  `npm run wa -- index --full` to pick up edits.
-- **File imports are snapshots.** Sync reads the configured source file; it does
-  not fetch new messages from a phone or decrypt backups. Import a newer file
-  to add more history. On macOS, scheduled sync can read the live Desktop store.
+This fork builds on [Pedro Schott's WhatMCP](https://github.com/pedroschott/whatmcp).
+Licensed under [MIT](LICENSE).

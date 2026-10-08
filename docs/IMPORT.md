@@ -14,8 +14,9 @@ do not establish compatibility.
 
 A database extracted from an iOS backup can be used if its schema matches. Extract
 and decrypt it before import. WhatMCP does not extract device backups, decrypt
-files, or parse chat exports. It has no adapter for the Windows WhatsApp app or
-Android message databases.
+files, or parse chat exports. This reader does not parse native Windows or Android
+message databases. For live Windows WhatsApp acquisition, use the separate
+[WAren6 adapter](WINDOWS.md).
 
 For an encrypted Finder backup, follow [Import iPhone history](IPHONE.md).
 
