@@ -40,6 +40,40 @@ test('WAren6 import appends newer messages and is idempotent', () => {
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
+test('incremental import recovers old missing bodies without importing old unrelated history', () => {
+  const dir=mkdtempSync(join(tmpdir(),'whatmcp-win-recovery-'));
+  try {
+    const archive=join(dir,'archive.db'), source=join(dir,'source.db');
+    const db=openStore(archive), old=1_700_000_000, latest=old+30*86400;
+    db.prepare('INSERT INTO threads(id,kind,first_seen_at,last_seen_at) VALUES(?,?,?,?)')
+      .run('chat','dm',old,latest);
+    const insert=db.prepare('INSERT INTO messages(id,thread_id,ts,text,is_from_me,kind,stanza_id,first_seen_at) VALUES(?,?,?,?,?,?,?,?)');
+    insert.run('chat:missing','chat',old,null,0,'text','missing',old);
+    insert.run('chat:blank','chat',old,'  ',0,'text','blank',old);
+    insert.run('chat:preserved','chat',old,'original',0,'text','preserved',old);
+    db.prepare('INSERT INTO sync_state(id,last_source_pk,last_ts,last_run_at,msg_count,full_runs) VALUES(?,0,?,?,3,0)')
+      .run('windows-waren6',latest,latest);
+    db.close();
+    const s=new DatabaseSync(source);
+    s.exec('CREATE TABLE messages(msg_id TEXT,chat_jid TEXT,chat_name TEXT,sender_jid TEXT,sender_name TEXT,from_me INTEGER,timestamp INTEGER,text TEXT,is_group INTEGER,msg_type TEXT)');
+    const row=s.prepare('INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?)');
+    for(const [id,text] of [['missing','recovered body'],['blank','recovered blank'],['preserved','replacement'],['unrelated','old history']])
+      row.run(id,'chat','Chat',null,null,0,old,text,0,'chat');
+    s.close();
+    const result=importWindowsUnified(archive,source);
+    assert.equal(result.recovered,2);
+    assert.equal(result.added,0);
+    const check=openStore(archive);
+    assert.equal((check.prepare("SELECT text FROM messages WHERE id='chat:missing'").get() as any).text,'recovered body');
+    assert.equal((check.prepare("SELECT text FROM messages WHERE id='chat:preserved'").get() as any).text,'original');
+    assert.equal(check.prepare("SELECT id FROM messages WHERE id='chat:unrelated'").get(),undefined);
+    assert.equal((check.prepare("SELECT last_ts FROM sync_state WHERE id='windows-waren6'").get() as any).last_ts,latest);
+    assert.ok((check.prepare("SELECT COUNT(*) n FROM windows_fts WHERE windows_fts MATCH 'recovered'").get() as any).n>0);
+    check.close();
+    assert.equal(importWindowsUnified(archive,source).recovered,0);
+  } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
 test('Windows import invalidates prepared audio candidates before publication', () => {
   const dir=mkdtempSync(join(tmpdir(),'whatmcp-win-projection-'));
   try {

@@ -8,6 +8,7 @@ param(
     [string]$CasesDirectory,
     [string]$SourceDirectory,
     [switch]$Full,
+    [switch]$NightlyRecovery = ($env:WHATMCP_NIGHTLY_RECOVERY -eq '1'),
     [switch]$ResultJson
 )
 
@@ -33,6 +34,37 @@ $copyStats = @()
 $started = Get-Date
 $mutex = [Threading.Mutex]::new($false, 'Local\WhatMCP-HotCopy-Sync')
 $hasMutex = $false
+$restoreWhatsApp = $false
+$runtimeJsonl = $null
+$runtimeCaptureStatus = 'not_requested'
+
+function Stop-WhatsAppForSnapshot {
+    $processes = @(Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue)
+    foreach ($process in $processes) { [void]$process.CloseMainWindow() }
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ((Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue) -and $watch.ElapsedMilliseconds -lt 5000) {
+        Start-Sleep -Milliseconds 250
+    }
+    Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction Stop
+    $watch.Restart()
+    while ((Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue) -and $watch.ElapsedMilliseconds -lt 5000) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue) { throw 'WhatsApp did not close; closed snapshot cancelled' }
+    Write-RunLog 'WhatsApp closed for consistent evidence copy'
+}
+
+function Restore-WhatsAppAfterSnapshot {
+    if (-not $script:restoreWhatsApp) { return }
+    Start-Process -FilePath 'explorer.exe' -ArgumentList 'shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App' -WindowStyle Hidden | Out-Null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue) -and $watch.ElapsedMilliseconds -lt 15000) {
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not (Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue)) { throw 'WhatsApp could not be reopened after snapshot' }
+    $script:restoreWhatsApp = $false
+    Write-RunLog 'WhatsApp reopened after evidence copy'
+}
 
 function Write-RunLog([string]$message) {
     $line = "$(Get-Date -Format o) $message"
@@ -139,10 +171,30 @@ try {
     Write-OwnedMarker $run 'created'
     Write-RunLog "START run=$runId whatsapp_running=$([bool](Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue))"
 
+    if ($NightlyRecovery) {
+        $restoreWhatsApp = [bool](Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue)
+        $runtimeRoot = Join-Path $run 'nightly-runtime'
+        $runtimeLog = Join-Path $logs "runtime-$runId.log"
+        Write-RunLog 'Nightly recovery: restarting WhatsApp to capture runtime Store 8 text'
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $waren6 `
+            -r -c $runtimeRoot -s *> $runtimeLog
+        $runtimeExit = $LASTEXITCODE
+        $candidate = Join-Path $runtimeRoot 'runtime\runtime_store8_messages.jsonl'
+        if ($runtimeExit -eq 0 -and (Test-Path -LiteralPath $candidate) -and (Get-Item -LiteralPath $candidate).Length -gt 0) {
+            $runtimeJsonl = $candidate
+            $runtimeCaptureStatus = 'captured'
+        } else {
+            $runtimeCaptureStatus = 'failed'
+            Write-RunLog "Runtime recovery unavailable exit=$runtimeExit; continuing with closed snapshot; see $runtimeLog"
+        }
+        Stop-WhatsAppForSnapshot
+    }
+
     Copy-LiveDirectory 'LocalState' 'LocalState' $true
     Copy-AudioTransfers
     Copy-LiveDirectory 'LocalCache\EBWebView\Default\IndexedDB' 'LocalCache\EBWebView\Default\IndexedDB'
     Copy-LiveDirectory 'LocalCache\EBWebView\Default\Local Storage' 'LocalCache\EBWebView\Default\Local Storage'
+    if ($NightlyRecovery) { Restore-WhatsAppAfterSnapshot }
 
     $caseOutput = if ($CasesDirectory) { Join-Path $CasesDirectory $runId } else { Join-Path $run 'cases' }
     New-Item -ItemType Directory -Path $caseOutput -Force | Out-Null
@@ -161,10 +213,11 @@ try {
     $env:WHATMCP_AUDIO_CACHE_PATH = Join-Path $source 'LocalCache\EBWebView\Default\Cache\Cache_Data'
     $env:WHATMCP_AUDIO_CACHE_PYTHON = if ($PythonPath) { $PythonPath } else { 'python.exe' }
     $env:WHATMCP_AUDIO_CACHE_VENDOR = Join-Path (Split-Path $waren6 -Parent) 'vendor'
-    Write-RunLog 'Starting WAren6 on copied evidence; WhatsApp remains open'
+    Write-RunLog "Starting WAren6 on copied evidence; acquisition_mode=$(if ($NightlyRecovery) { 'closed_snapshot' } else { 'hot_copy' })"
+    $supplementArguments = if ($runtimeJsonl) { @('-j', $runtimeJsonl) } else { @() }
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $waren6 `
         -f -n -m -NoArchive -KeepCaseDirectoryAfterArchive -PreservedCopy `
-        -w (Join-Path $run 'LocalState') -d $caseOutput -s *> $extractorLog
+        -w (Join-Path $run 'LocalState') -d $caseOutput -s @supplementArguments *> $extractorLog
     $extractorExit = $LASTEXITCODE
     if ($extractorExit -ne 0) { throw "WAren6 exit=$extractorExit; see $extractorLog" }
     $case = Get-ChildItem -LiteralPath $caseOutput -Directory -Filter 'WAren6_*' |
@@ -209,8 +262,16 @@ try {
     $reason = $_.Exception.Message
     Write-RunLog "FAILED $reason"
 } finally {
+    if ($NightlyRecovery -and $restoreWhatsApp) {
+        try { Restore-WhatsAppAfterSnapshot } catch { Write-Warning $_.Exception.Message; $status = 'failed'; $reason = $_.Exception.Message }
+    }
     $summary = [ordered]@{
         run_id = $runId; started = $started.ToString('o'); ended = (Get-Date).ToString('o')
+        acquisition_mode = if ($NightlyRecovery) { 'closed_snapshot' } else { 'hot_copy' }
+        runtime_capture_status = $runtimeCaptureStatus
+        opaque_unresolved = if ($metrics) { $metrics.store8_opaque_unresolved_messages } else { $null }
+        runtime_decoded = if ($metrics) { $metrics.store8_runtime_decoded_messages } else { $null }
+        recovered = if ($importResult) { $importResult.recovered } else { $null }
         status = $status; reason = $reason; whatsapp_running_after = [bool](Get-Process -Name WhatsApp.Root -ErrorAction SilentlyContinue)
         copy = $copyStats; messages = if ($metrics) { $metrics.messages } else { $null }
         non_empty_text = if ($metrics) { $metrics.non_empty_text } else { $null }

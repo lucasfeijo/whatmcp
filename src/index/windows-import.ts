@@ -42,9 +42,15 @@ export function importWindowsUnified(
       const archiveLatest = Number((db.prepare('SELECT MAX(ts) n FROM messages').get() as { n: number | null }).n ?? 0);
       const since = opts.full ? 0 : state ? Math.max(0, state.last_ts - 7 * 86400) : archiveLatest;
       opts.progress?.(`scanning WAren6 after ${new Date(since * 1000).toISOString()}`);
+      // A later extraction may recover an old body. The time watermark must
+      // limit new history, but must not exclude repairs to archived messages.
+      if (!opts.full) src.prepare('ATTACH DATABASE ? AS archive_recovery').run(archivePath);
       const rows = src.prepare(
-        'SELECT rowid,msg_id,chat_jid,chat_name,sender_jid,sender_name,from_me,timestamp,text,is_group,msg_type ' +
-        'FROM messages WHERE timestamp>? AND timestamp<=? ORDER BY timestamp,rowid'
+        'SELECT s.rowid,s.msg_id,s.chat_jid,s.chat_name,s.sender_jid,s.sender_name,s.from_me,s.timestamp,s.text,s.is_group,s.msg_type ' +
+        'FROM messages s WHERE (s.timestamp>?' + (!opts.full ?
+          " OR (length(trim(s.text))>0 AND EXISTS (SELECT 1 FROM archive_recovery.messages a " +
+          "WHERE a.id=s.chat_jid||':'||s.msg_id AND (a.text IS NULL OR trim(a.text)='')))" : '') +
+        ') AND s.timestamp<=? ORDER BY s.timestamp,s.rowid'
       ).all(since, Math.floor(Date.now()/1000)+86400) as Row[];
       const allowedAudio = new Set((db.prepare("SELECT id FROM messages WHERE kind='audio'").all() as {id:string}[]).map(r=>r.id));
       for(const r of rows) if(kind(r.msg_type)==='audio' && r.chat_jid?.trim() && r.msg_id?.trim()) {
@@ -72,7 +78,7 @@ export function importWindowsUnified(
         INSERT INTO messages (id,thread_id,sender_id,ts,text,is_from_me,kind,stanza_id,source_pk,first_seen_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET text=excluded.text
-        WHERE messages.text IS NULL AND excluded.text IS NOT NULL
+        WHERE (messages.text IS NULL OR trim(messages.text)='') AND excluded.text IS NOT NULL
       `);
       const touched = new Set<string>();
       let audioReferenced = 0;
@@ -92,7 +98,7 @@ export function importWindowsUnified(
           if (senderId) sender.run(senderId,mine ? 'me':r.sender_name,phoneOf(senderId),mine ? 1:0,now,now);
           const changed=Number(message.run(id,jid,senderId,ts,body,mine ? 1:0,kind(r.msg_type),stanza,r.rowid,now).changes)>0;
           if (!old && changed) added++;
-          else if (old && old.text===null && body && changed) recovered++;
+          else if (old && !old.text?.trim() && body && changed) recovered++;
           if (changed && (body || kind(r.msg_type) === 'audio')) {
             markProjectionDirty(db, jid);
             touched.add(jid);
