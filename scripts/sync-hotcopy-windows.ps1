@@ -149,6 +149,7 @@ try {
     Write-OwnedMarker $caseOutput 'created'
     $extractorLog = Join-Path $logs "waren6-$runId.log"
     $env:WHATMCP_HOME = $data
+    $env:WAREN6_INDEXEDDB_CACHE = Join-Path $data 'indexeddb-cache\cache.sqlite'
     $env:WHATMCP_AUDIO_ACQUISITION_ENABLED = '0'
     $audioConfigPath = Join-Path $data 'config.json'
     if (Test-Path -LiteralPath $audioConfigPath) {

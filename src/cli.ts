@@ -30,6 +30,8 @@ import { readSecret } from './secret-input.ts';
 import { runSyncProcess, syncWorkerCommand, syncTimeoutMs } from './sync-process.ts';
 import { runScheduledSync } from './scheduled-sync.ts';
 import { tryAcquireSyncLock } from './sync-lock.ts';
+import { coordinateSync } from './sync-coordinator.ts';
+import { canReuseAcquisition, completeAcquisitionRun, invalidateAcquisition, recordAcquisition, syncSourceIdentity, ACQUISITION_REUSE_MS } from './sync-acquisition.ts';
 import { availableModels } from './transcription/models.ts';
 import { importMediaManifest, runTranscription, scanConfiguredSource } from './transcription/worker.ts';
 import { mediaStats } from './transcription/media.ts';
@@ -429,42 +431,68 @@ switch (cmd) {
   }
 
   case 'sync-worker': {
-    const release = tryAcquireSyncLock();
-    if (!release) {
-      console.error('another sync is already running; this request was skipped');
-      process.exitCode = 75;
-      break;
-    }
-    try {
-      const cfg = loadConfig();
-      const t0 = Date.now();
-      console.log(bold('indexing'));
-      if (cfg.sourceType === 'windows-waren6') {
-        const r = await runWindowsIndex(cfg, { full: flag('full'), progress: m => console.log('  ' + m) });
-        console.log(`  ${r.added} new, ${r.recovered} texts recovered, ${r.windowsBuilt} windows built (${r.total} archived)`);
-      } else {
-        const r = runIndex(cfg.store, {
-          chatstorage: cfg.chatstorage,
-          mediaSourceId: cfg.mediaSourceId,
-          full: flag('full'),
-          onProgress: (m) => console.log(`  ${m}`),
-        });
-        console.log(
-          `  ${r.newMessages} new, ${r.updatedMessages} updated, ` +
-            `${r.windowsBuilt} window(s) built  (${r.totalMessages} archived)`,
-        );
+    const cfg = loadConfig();
+    const optimizeWindowsSync = process.platform === 'win32';
+    const runWorker = async () => {
+      const release = tryAcquireSyncLock();
+      if (!release) {
+        console.error('another sync is already running; this request was skipped');
+        return 75;
       }
-      if (flag('index-only')) {
-        console.log('processing deferred until after scheduled transcription');
-      } else {
-        await processImportedArchive(cfg, { onProgress: m => console.log('  ' + m),
-          onEmbeddingProgress: onProgress, calibrate: calibrateIfUnset,
-          skipTranscription: flag('skip-auto-transcription') });
+      try {
+        const t0 = Date.now();
+        console.log(bold('indexing'));
+        const reusedAcquisition = optimizeWindowsSync && canReuseAcquisition(cfg, flag('full'));
+        if (reusedAcquisition) {
+          console.log(`  reusing successful acquisition (${ACQUISITION_REUSE_MS / 1000}s reuse window); processing pending work`);
+        } else {
+          if (optimizeWindowsSync) invalidateAcquisition();
+          if (cfg.sourceType === 'windows-waren6') {
+            const r = await runWindowsIndex(cfg, { full: flag('full'), progress: m => console.log('  ' + m) });
+            console.log(`  ${r.added} new, ${r.recovered} texts recovered, ${r.windowsBuilt} windows built (${r.total} archived)`);
+          } else {
+            const r = runIndex(cfg.store, {
+              chatstorage: cfg.chatstorage,
+              mediaSourceId: cfg.mediaSourceId,
+              full: flag('full'),
+              onProgress: (m) => console.log(`  ${m}`),
+            });
+            console.log(
+              `  ${r.newMessages} new, ${r.updatedMessages} updated, ` +
+                `${r.windowsBuilt} window(s) built  (${r.totalMessages} archived)`,
+            );
+          }
+          try { if (optimizeWindowsSync) recordAcquisition(cfg); }
+          catch (error) { console.error(`could not record acquisition reuse: ${String(error)}`); }
+        }
+        if (flag('index-only')) {
+          console.log('processing deferred until after scheduled transcription');
+        } else {
+          await processImportedArchive(cfg, { onProgress: m => console.log('  ' + m),
+            onEmbeddingProgress: onProgress, calibrate: calibrateIfUnset,
+            skipTranscription: flag('skip-auto-transcription') });
+        }
+        if (optimizeWindowsSync && !reusedAcquisition) {
+          try { completeAcquisitionRun(cfg); }
+          catch (error) { console.error(`could not record acquisition completion: ${String(error)}`); }
+        }
+        console.log(`done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+        return 0;
+      } finally {
+        release();
       }
-      console.log(`done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-    } finally {
-      release();
-    }
+    };
+    // Keep macOS/Linux acquisition and lock behavior unchanged. On Windows,
+    // updated workers also coordinate requests from older long-lived parents.
+    process.exitCode = optimizeWindowsSync
+      ? await coordinateSync(process.execPath, ['sync-worker', ...rest], {
+        coordinationPath: join(DATA_DIR, 'sync-worker-coordinator.json'),
+        coordinationIdentity: syncSourceIdentity(cfg),
+        timeoutMs: syncTimeoutMs(cfg.sourceType, cfg.syncTimeoutMinutes,
+          !!(cfg.transcriptionAutoAfterImport && cfg.transcriptionModel)),
+        onOutput: message => process.stdout.write(message),
+      }, runWorker)
+      : await runWorker();
     break;
   }
 

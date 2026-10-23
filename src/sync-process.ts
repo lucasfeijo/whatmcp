@@ -2,7 +2,9 @@ import { spawn } from 'node:child_process';
 import { constants } from 'node:os';
 import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { DATA_DIR, resolveSyncTimeoutMinutes } from './config.ts';
+import { coordinateSync } from './sync-coordinator.ts';
+import { syncSourceIdentity } from './sync-acquisition.ts';
+import { DATA_DIR, loadConfig, resolveSyncTimeoutMinutes } from './config.ts';
 
 export const SYNC_TIMEOUT_MS = resolveSyncTimeoutMinutes(undefined, 'chatstorage') * 60_000;
 export const WINDOWS_SYNC_TIMEOUT_MS = resolveSyncTimeoutMinutes(undefined, 'windows-waren6') * 60_000;
@@ -21,6 +23,10 @@ export interface SyncProcessOptions {
   scheduled?: boolean;
   /** Override only for isolated tests. */
   pausePath?: string;
+  /** Override only for isolated coordinator tests. */
+  coordinationPath?: string;
+  /** Configuration scope whose work may be shared. */
+  coordinationIdentity?: string;
 }
 
 export function isScheduledSyncPaused(path = SYNC_PAUSE_PATH): boolean {
@@ -50,6 +56,17 @@ export async function runSyncProcess(
   args: string[],
   options: SyncProcessOptions = {},
 ): Promise<number> {
+  const coordinated = (process.platform === 'win32' && args.includes('sync-worker')) || options.coordinationPath !== undefined;
+  if (coordinated) {
+    return coordinateSync(command, args, { ...options,
+      coordinationIdentity: options.coordinationIdentity ?? (args.includes('sync-worker')
+        ? syncSourceIdentity(loadConfig()) : undefined),
+    }, () => runWatchedSyncProcess(command, args, options));
+  }
+  return runWatchedSyncProcess(command, args, options);
+}
+
+async function runWatchedSyncProcess(command: string, args: string[], options: SyncProcessOptions): Promise<number> {
   const { timeoutMs = SYNC_TIMEOUT_MS, graceMs = STOP_GRACE_MS,
     onOutput, scheduled = false, pausePath = SYNC_PAUSE_PATH } = options;
   if (scheduled && isScheduledSyncPaused(pausePath)) {

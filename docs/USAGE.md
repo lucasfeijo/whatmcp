@@ -155,6 +155,15 @@ do not prevent the final sync, while capture failure stops the pipeline.
 automatic post-import transcription adds 45 minutes to the base watchdog. A sync
 lock prevents overlapping writers. After a timeout, scheduled attempts pause;
 a successful manual `npm run sync` resumes them. Completed archive work is retained.
+On Windows, concurrent CLI/MCP sync requests follow the running worker and return its exit
+status instead of queuing another extraction. A request that needs a full pass
+or processing omitted by that worker returns exit 75; retry it after the running
+job finishes. Incremental syncs can reuse a successful acquisition/import from
+the last 90 seconds for the same source and archive, while still processing
+pending transcription and embeddings. If that acquisition's original sync takes
+longer to process audio, the window starts when it finishes. Reuse never extends
+the window or updates the archive's source freshness. `--full` always performs acquisition.
+macOS and Linux retain the existing acquisition, lock and scheduled transcription flow.
 Logs live in the profile's `logs/sync.log`. See [Windows scheduling](WINDOWS.md#scheduled-collection)
 for the separate Task Scheduler workflow.
 

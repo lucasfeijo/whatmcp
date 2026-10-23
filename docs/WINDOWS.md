@@ -52,6 +52,13 @@ WAren6 offline against that copy with `-f -n -m -NoArchive -PreservedCopy`, vali
 the new case and imports its `unified_whatsapp.db`. Manual sync also embeds new
 windows. There is no close/reopen step or confirmation dialog.
 
+The hot-copy integration sets `WAREN6_INDEXEDDB_CACHE` to the profile's
+`indexeddb-cache/cache.sqlite`. With a WAren6 version supporting that optional
+cache, unchanged physical files and serialized values are reused on later runs.
+Content hashes and decoder versions invalidate changed data. The snapshot is
+still checked and imported normally; the first run populates the cache. Treat
+the cache as private source data, outside Git and cloud sync folders.
+
 Use the WAren6 fork's preserved-copy implementation, starting at commit
 `e53aa64`. Use `3fd7f19` or newer for the quoted-reply index that avoids
 repeated full-chat scans during unification. The audio acquisition described here
