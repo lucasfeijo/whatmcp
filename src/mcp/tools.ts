@@ -25,7 +25,7 @@ import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
-import { type Config, CONFIG_PATH } from '../config.ts';
+import { type Config } from '../config.ts';
 import {
   searchHybrid, getConversation, listMessageFeed, listThreads, listPeople,
   getTimeline, getThreadSummary, stats, type SearchContext, type Stats,
@@ -44,6 +44,8 @@ export interface ToolDeps {
   keyError: string | null;
   /** OAuth read grants omit the one tool that writes and sends data externally. */
   allowSync?: boolean;
+  /** Process runner override for isolated tool tests. */
+  runSync?: typeof runSyncProcess;
 }
 
 const iso = (ts: number) => new Date(ts * 1000).toISOString();
@@ -156,9 +158,10 @@ export function buildServer(deps: ToolDeps): McpServer {
 
   const hasArchive = () => existsSync(cfg.store);
 
-  const keyMissing = () =>
-    'No OpenAI API key is configured, so semantic search is unavailable.\n' +
-    `${keyError}\nConfig file: ${CONFIG_PATH}`;
+  const keyMissing = () => {
+    console.error(`[search_messages] ${keyError ?? 'Search configuration unavailable'}`);
+    return 'Semantic search is unavailable. Check the app configuration.';
+  };
 
   /**
    * How far behind the live WhatsApp store the archive is.
@@ -280,11 +283,16 @@ export function buildServer(deps: ToolDeps): McpServer {
         minSim: cfg.minSim,
         strongSim: cfg.strongSim,
       });
+      const searchNotice = out.degraded
+        ? 'Semantic search is unavailable or incomplete. Results may be incomplete. ' +
+          'Retry with mode="bm25" for keyword-only search, or run sync_archive to update the archive.'
+        : '';
+      if (out.degraded) console.error(`[search_messages] ${out.degraded}`);
 
       if (out.hits.length === 0) {
         return text(
           `No messages found for "${query}".\n` +
-            (out.degraded ? `\n${out.degraded}\n` : '') +
+            (searchNotice ? `\n${searchNotice}\n` : '') +
             `\n${freshness()}`,
         );
       }
@@ -316,7 +324,7 @@ export function buildServer(deps: ToolDeps): McpServer {
           : `${out.hits.length} result(s) for "${query}" (${out.strongCount} strong).\n` +
             `Expand any of them with get_conversation using its thread_id and timestamp.\n\n`;
 
-      return text(preamble + (out.degraded ? `NOTE: ${out.degraded}\n\n` : '') + fence(body));
+      return text(preamble + (searchNotice ? `NOTE: ${searchNotice}\n\n` : '') + fence(body));
     },
   );
 
@@ -361,7 +369,7 @@ export function buildServer(deps: ToolDeps): McpServer {
       title: 'List messages since',
       description:
         'List individual archived messages in chronological order across all chats, ' +
-        'without a search query, embeddings, or relevance ranking. Paginate until ' +
+        'without a search query or relevance ranking. Paginate until ' +
         'has_more is false to cover the full date range. Sync first when recent ' +
         'messages matter. Date filters use message time; later imports of older ' +
         'messages require rescanning their time range.',
@@ -552,8 +560,8 @@ export function buildServer(deps: ToolDeps): McpServer {
     {
       title: 'Archive status',
       description:
-        'Coverage and freshness of the local archive: message, chat and window ' +
-        'counts, the date range available, embedding coverage, and how far behind ' +
+        'Coverage and freshness of the local archive: message and chat ' +
+        'counts, the date range available, search readiness, and how far behind ' +
         'WhatsApp it is. Check this before concluding that something is absent from ' +
         "the user's history.",
       inputSchema: {},
@@ -564,26 +572,24 @@ export function buildServer(deps: ToolDeps): McpServer {
       const s = stats(ctx());
       const audio = mediaStats(getStore(cfg.store,
         modelTag({ model: cfg.openaiModel, dimensions: cfg.openaiDims })).db);
-      const pct = s.windows ? Math.round((s.embedded / s.windows) * 100) : 0;
+      if (audio.lastError) console.error(`[get_archive_status audio] ${audio.lastError}`);
       return text(
         `WhatMCP archive\n` +
           `  messages:  ${s.messages}\n` +
           `  chats:     ${s.threads}\n` +
           `  people:    ${s.senders}\n` +
-          `  windows:   ${s.windows}\n` +
-          `  embedded:  ${s.embedded}/${s.windows} (${pct}%) — ${s.model}\n` +
+          `  search:    ${s.embedded < s.windows ? 'partially ready' : 'ready'}\n` +
           `  audio:     ${audio.available}/${audio.referenced} files available; ` +
-            `${audio.done} message(s) with transcripts, ${audio.pendingAudio} audio(s) pending; ${audio.pendingThreads} chat(s) pending projection\n` +
-          (audio.lastError ? `  audio last error: ${audio.lastError}\n` : '') +
+            `${audio.done} message(s) with transcripts, ${audio.pendingAudio} audio(s) pending\n` +
+          (audio.lastError ? '  audio: some audio could not be processed; check the app diagnostics\n' : '') +
           `  range:     ${iso(s.earliest)} to ${iso(s.latest)}\n` +
           `  last sync: ${s.last_sync_at ? iso(s.last_sync_at) : 'never'}\n\n` +
           freshness(s) +
           (isScheduledSyncPaused()
             ? '\n\nScheduled sync is paused after a timeout. Run sync_archive manually to retry; a successful sync resumes the schedule.'
             : '') +
-          (pct < 100
-            ? `\n\n${s.windows - s.embedded} window(s) have no vector, so semantic ` +
-              `search cannot see them. Run sync_archive to finish embedding.`
+          (s.embedded < s.windows
+            ? '\n\nSome archived content is not yet available to semantic search. Run sync_archive to finish processing.'
             : ''),
       );
     },
@@ -594,51 +600,36 @@ export function buildServer(deps: ToolDeps): McpServer {
       'sync_archive',
       {
         title: 'Sync archive',
-        description:
-          (cfg.sourceType === 'windows-waren6'
-            ? 'Acquire and import the encrypted Windows Desktop store with WAren6, then ' +
-              'generate embeddings for every pending conversation window. ' +
-              'This can take minutes. Uses the same validated hot-copy pipeline as the ' +
-              'scheduled sync, while WhatsApp remains open; no close confirmation is needed. '
-            : 'Bring the local archive up to date with WhatsApp Desktop: index new ' +
-          'messages, then embed anything missing. Read-only with respect to WhatsApp ' +
-          'itself — it copies and reads, and never writes or sends. Takes seconds for ' +
-          'a routine catch-up. Use when get_archive_status reports the archive is ' +
-          'behind, or when a search for something recent finds nothing.') +
-          ' Do not call this before every query. Read tools use the existing archive without syncing. ' +
-          'Call only when the user requests a refresh or the answer requires data newer than the last successful sync. ' +
-          'Windows synchronization can take several minutes (up to a 30-minute timeout). ' +
-          'When transcription_auto_after_import is enabled, pending audio is transcribed before embeddings; ' +
-          'the sync timeout includes an additional 45 minutes for resumable audio processing.',
+        description: 'Sincroniza o histórico do WhatsApp.',
         inputSchema: {
           full: z.boolean().optional()
             .describe('Re-read the entire WhatsApp store rather than only new messages. ' +
                       'Slower; catches edits. Never deletes archived messages.'),
         },
-        // Not read-only: it writes to the archive and calls the embeddings API.
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
       },
       async ({ full }) => {
         const [command, args] = syncWorkerCommand(full);
         let output = '';
         const timeoutMs = syncTimeoutMs(cfg.sourceType, cfg.syncTimeoutMinutes, !!(cfg.transcriptionAutoAfterImport && cfg.transcriptionModel));
-        const code = await runSyncProcess(command, args, {
+        const code = await (deps.runSync ?? runSyncProcess)(command, args, {
           timeoutMs,
           onOutput: (chunk) => { output = (output + chunk).slice(-8000); },
         });
         // The child may have written some messages even when embedding failed.
         invalidate();
+        // Keep worker diagnostics in the app, not in the conversational API.
+        if (output.trim()) console.error(`[sync_archive exit=${code}]\n${output.trim()}`);
         if (code !== 0) {
           throw new Error(code === 124
             ? `Sync exceeded ${timeoutMs / 60000} minutes and was stopped. Scheduled sync is paused until a manual sync succeeds.`
             : code === 75
               ? 'Another sync is already running; this request was skipped.'
-            : `Sync failed (exit ${code}): ${output.trim()}`);
+            : `Sync failed (exit ${code}). Check the app diagnostics before retrying.`);
         }
         const s = stats(ctx());
         return text(
           `Sync complete (${full ? 'full' : 'incremental'} pass).\n` +
-            `${output.trim()}\n` +
             `archive now holds ${s.messages} message(s) across ${s.threads} chat(s)`,
         );
       },

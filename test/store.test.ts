@@ -131,9 +131,72 @@ test('archive status reuses one stats snapshot without loading vectors', async (
       const result = await client.callTool({ name: 'get_archive_status', arguments: {} });
       assert.notEqual(result.isError, true);
       assert.equal(messageCounts, 1);
+      const response = JSON.stringify(result);
+      assert.match(response, /search:.*ready/);
+      assert.doesNotMatch(response, /embedded|embedding|vector|synthetic-test|projection/i);
+      const catalog = await client.listTools();
+      assert.doesNotMatch(JSON.stringify(catalog.tools.map(tool => tool.description)), /embedding/i);
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+});
+
+test('MCP sync runs the complete worker but only returns public outcomes', async t => {
+  const diagnostics: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => diagnostics.push(args.join(' ')));
+  await fixture(async f => {
+    f.get();
+    let exitCode = 0;
+    const commands: string[][] = [];
+    const server = buildServer({
+      cfg: {
+        store: f.path, chatstorage: '', sourceType: 'windows-waren6',
+        windowsWaren6Path: null, windowsOutputDir: f.dir,
+        openaiKey: null, openaiModel: embedCfg.model, openaiDims: 4,
+        syncIntervalHours: 0,
+      },
+      embedCfg: null, keyError: 'synthetic test',
+      runSync: async (_command, args, options) => {
+        commands.push(args);
+        options?.onOutput?.('private-worker-detail: embeddings provider diagnostics');
+        return exitCode;
+      },
+    });
+    const client = new Client({ name: 'sync-contract-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const catalog = await client.listTools();
+      const sync = catalog.tools.find(tool => tool.name === 'sync_archive')!;
+      assert.equal(sync.description, 'Sincroniza o histórico do WhatsApp.');
+      assert.deepEqual(Object.keys(sync.inputSchema.properties ?? {}), ['full']);
+      assert.equal(sync.annotations?.readOnlyHint, false);
+      assert.equal(sync.annotations?.openWorldHint, true);
+      for (const full of [false, true]) {
+        const result = await client.callTool({ name: 'sync_archive', arguments: { full } });
+        f.get(); // Track each cache handle before the next sync invalidates it.
+        assert.notEqual(result.isError, true);
+        assert.match(JSON.stringify(result), /Sync complete/);
+        assert.doesNotMatch(JSON.stringify(result), /private-worker-detail|embedding|provider/i);
+        assert.ok(commands.at(-1)?.includes('sync-worker'));
+        assert.equal(commands.at(-1)?.includes('--full'), full);
+        assert.equal(commands.at(-1)?.includes('--index-only'), false);
+      }
+      for (const [code, expected] of [[1, /Sync failed/], [75, /already running/], [124, /was stopped/]] as const) {
+        exitCode = code;
+        const result = await client.callTool({ name: 'sync_archive', arguments: {} });
+        assert.equal(result.isError, true);
+        assert.match(JSON.stringify(result), expected);
+        assert.doesNotMatch(JSON.stringify(result), /private-worker-detail|embedding|provider/i);
+      }
+      assert.ok(diagnostics.some(line => line.includes('private-worker-detail')));
+    } finally {
+      await client.close();
+      await server.close();
+      f.get();
     }
   });
 });
